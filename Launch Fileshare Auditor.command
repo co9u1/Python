@@ -1,0 +1,5 @@
+#!/bin/bash
+# Double-click launcher for the Fileshare Access Auditor app.
+cd "$(dirname "$0")"
+source .venv/bin/activate
+python3 main.py
