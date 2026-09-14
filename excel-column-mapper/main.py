@@ -1,0 +1,1128 @@
+"""
+Excel Column Mapper
+-------------------
+Reads rows from a source Excel sheet and appends them into a chosen tab of
+a target workbook, using column mappings defined at runtime.
+
+Each mapping is: source column -> target column, with an optional
+"extract after <delimiter>" rule that can be switched on or off per
+mapping. Mappings can be added and removed freely.
+
+An optional auto-incrementing ID (prefix + zero-padded number) can be
+written to a target column of your choice, continuing from the highest
+existing ID already in that column.
+
+The preview table is live: it rebuilds from the current settings on every
+edit, so it always shows exactly what will be written. Appending
+recomputes from scratch first, so the two can never drift apart.
+
+The target workbook is edited in place and rows are only ever appended -
+existing rows and other tabs are left untouched.
+
+Note: saving goes through openpyxl, which rewrites the workbook file.
+Values, formulas and (for .xlsm) macros survive; charts, images and pivot
+tables do not.
+"""
+
+import os
+import re
+
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, ttk
+
+import openpyxl
+from openpyxl.utils import column_index_from_string, get_column_letter
+
+APP_TITLE = "Excel Column Mapper"
+DEFAULT_ID_PREFIX = "FS"
+DEFAULT_ID_COL = "A"
+DEFAULT_DELIMITER = "/vol/"
+ID_PAD = 3
+
+# Excel's own limits on worksheet names.
+INVALID_SHEET_CHARS = "[]:*?/\\"
+MAX_SHEET_NAME = 31
+
+COLUMN_CHOICES = [get_column_letter(i) for i in range(1, 41)]  # A..AN
+
+
+def extract_after_delimiter(value: str, delimiter: str) -> str:
+    """Return the substring after `delimiter`.
+
+    A blank delimiter means "take the whole cell". Matching is
+    case-insensitive, and '/' and '\\' are interchangeable so either path
+    style matches. Returns '' when the delimiter isn't found.
+    """
+    if value in (None, ""):
+        return ""
+    text = str(value).strip()
+
+    delim = (delimiter or "").strip()
+    if not delim:
+        return text
+
+    pattern = "".join(r"[\\/]" if ch in "\\/" else re.escape(ch) for ch in delim)
+    match = re.search(pattern, text, re.IGNORECASE)
+    return text[match.end():].strip() if match else ""
+
+
+def parse_column(text: str):
+    """Parse 'E' or 'A - Server' into a 1-based column index, or None."""
+    if not text:
+        return None
+    match = re.match(r"^\s*([A-Za-z]{1,3})(?:\b|$)", str(text))
+    if not match:
+        return None
+    try:
+        return column_index_from_string(match.group(1).upper())
+    except ValueError:
+        return None
+
+
+def next_id_number(ws, prefix: str, col_idx: int) -> int:
+    """Scan a target column for existing <prefix><digits> ids, return the next number."""
+    max_n = 0
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$", re.IGNORECASE)
+    for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, values_only=True):
+        val = row[0]
+        if not val:
+            continue
+        m = pattern.match(str(val).strip())
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    return max_n + 1
+
+
+def last_used_row(ws) -> int:
+    """Return the last row index (1-based) that has any content, 0 if empty."""
+    last = 0
+    for row_idx, row in enumerate(ws.iter_rows(), start=1):
+        if any(cell.value not in (None, "") for cell in row):
+            last = row_idx
+    return last
+
+
+# ---------- Color palette / fonts ----------
+BG_MAIN = "#eef1f8"
+BG_CARD = "#ffffff"
+BORDER = "#dde2ec"
+SHADOW = "#d2d7e6"
+HEADER_BG = "#20263f"
+HEADER_FG = "#ffffff"
+HEADER_SUB_FG = "#aab3cc"
+ACCENT = "#3b5bfd"
+ACCENT_ACTIVE = "#2c46d1"
+ACCENT_DISABLED = "#b9c3f7"
+SECONDARY_BG = "#e7eaf3"
+SECONDARY_ACTIVE = "#d9deec"
+SECONDARY_FG = "#2a3050"
+TEXT_DARK = "#1c2233"
+TEXT_MUTED = "#6b7280"
+WARN_BG = "#fff3cd"
+ROW_ALT = "#f5f7fc"
+SUCCESS = "#1e8f4e"
+WARNTEXT = "#b8860b"
+ERROR = "#d64545"
+
+FONT = "Avenir Next"
+
+
+def _tint(hex_color: str, amount: float = 0.85) -> str:
+    """Blend a hex color toward white; used for soft pastel badge backgrounds."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    r = int(r + (255 - r) * amount)
+    g = int(g + (255 - g) * amount)
+    b = int(b + (255 - b) * amount)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _round_rect_points(x1, y1, x2, y2, r):
+    return [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
+
+
+class PillButton(tk.Canvas):
+    """A rounded, hover-responsive button drawn on a canvas (real pill shape)."""
+
+    def __init__(
+        self,
+        parent,
+        text,
+        command=None,
+        bg_page=BG_CARD,
+        fill=ACCENT,
+        fill_active=ACCENT_ACTIVE,
+        fill_disabled=ACCENT_DISABLED,
+        fg="#ffffff",
+        font=(FONT, 11, "bold"),
+        padx=20,
+        pady=11,
+    ):
+        weight = font[2] if len(font) > 2 else "normal"
+        f = tkfont.Font(family=font[0], size=font[1], weight=weight)
+        text_w = f.measure(text)
+        text_h = f.metrics("linespace")
+        btn_w = text_w + padx * 2
+        btn_h = text_h + pady * 2
+
+        super().__init__(
+            parent,
+            width=btn_w,
+            height=btn_h,
+            bg=bg_page,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        # NOTE: tkinter.Widget reserves the `_w` attribute for the Tcl path
+        # name, so button dimensions are kept under different names.
+        self._btn_w = btn_w
+        self._btn_h = btn_h
+        self.command = command
+        self.text = text
+        self.font = font
+        self.fg = fg
+        self.fill = fill
+        self.fill_active = fill_active
+        self.fill_disabled = fill_disabled
+        self._state = "normal"
+
+        self._render(fill)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+
+    def _render(self, color):
+        self.delete("all")
+        r = self._btn_h / 2
+        pts = _round_rect_points(1, 1, self._btn_w - 1, self._btn_h - 1, r)
+        self.create_polygon(pts, smooth=True, fill=color, outline="")
+        self.create_text(
+            self._btn_w / 2, self._btn_h / 2, text=self.text, fill=self.fg, font=self.font
+        )
+
+    def _on_enter(self, _event):
+        if self._state == "normal":
+            self._render(self.fill_active)
+
+    def _on_leave(self, _event):
+        if self._state == "normal":
+            self._render(self.fill)
+
+    def _on_click(self, _event):
+        if self._state == "normal" and self.command:
+            self.command()
+
+    def set_state(self, state):
+        self._state = state
+        if state == "disabled":
+            self._render(self.fill_disabled)
+            self.configure(cursor="arrow")
+        else:
+            self._render(self.fill)
+            self.configure(cursor="hand2")
+
+
+class CircleBadge(tk.Canvas):
+    """A small filled circle with a centered emoji/glyph, for the header icon."""
+
+    def __init__(self, parent, glyph, diameter=48, bg_page=HEADER_BG, fill=ACCENT):
+        super().__init__(
+            parent, width=diameter, height=diameter, bg=bg_page,
+            highlightthickness=0, bd=0,
+        )
+        r = diameter / 2
+        self.create_oval(2, 2, diameter - 2, diameter - 2, fill=fill, outline="")
+        self.create_text(r, r, text=glyph, font=(FONT, int(diameter * 0.42)))
+
+
+class StatusBadge(tk.Canvas):
+    """A rounded pill with a status dot + message; auto-sizes to its text."""
+
+    def __init__(self, parent, bg_page=BG_MAIN, font=(FONT, 11)):
+        super().__init__(parent, width=1, height=1, bg=bg_page, highlightthickness=0, bd=0)
+        self.font_spec = font
+        self._badge_font = tkfont.Font(family=font[0], size=font[1])
+        self.set("", SUCCESS)
+
+    def set(self, text, color):
+        self.delete("all")
+        if not text:
+            self.configure(width=1, height=1)
+            return
+        pad_x, pad_y, dot_r, gap = 14, 8, 4, 8
+        text_w = self._badge_font.measure(text)
+        text_h = self._badge_font.metrics("linespace")
+        w = pad_x * 2 + dot_r * 2 + gap + text_w
+        h = text_h + pad_y * 2
+        self.configure(width=w, height=h)
+        r = h / 2
+        pts = _round_rect_points(0, 0, w, h, r)
+        self.create_polygon(pts, smooth=True, fill=_tint(color), outline="")
+        cx, cy = pad_x + dot_r, h / 2
+        self.create_oval(cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r, fill=color, outline="")
+        self.create_text(
+            cx + dot_r + gap, cy, text=text, anchor="w", fill=TEXT_DARK, font=self.font_spec
+        )
+
+
+class ScrollArea(tk.Frame):
+    """A fixed-height vertically scrollable container for the mapping rows."""
+
+    def __init__(self, parent, bg=BG_CARD, height=170):
+        super().__init__(parent, bg=bg)
+        self._area_canvas = tk.Canvas(
+            self, bg=bg, highlightthickness=0, bd=0, height=height
+        )
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self._area_canvas.yview)
+        self._area_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._area_canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner = tk.Frame(self._area_canvas, bg=bg)
+        self._area_window = self._area_canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw"
+        )
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self._area_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Wheel events land on whichever child is under the pointer, so grab them
+        # globally while the pointer is inside this area and release on the way out.
+        self.bind("<Enter>", self._bind_wheel)
+        self.bind("<Leave>", self._unbind_wheel)
+
+    def _on_inner_configure(self, _event):
+        self._area_canvas.configure(scrollregion=self._area_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self._area_canvas.itemconfigure(self._area_window, width=event.width)
+
+    def _bind_wheel(self, _event=None):
+        self._area_canvas.bind_all("<MouseWheel>", self._on_wheel)
+
+    def _unbind_wheel(self, _event=None):
+        self._area_canvas.unbind_all("<MouseWheel>")
+
+    def _on_wheel(self, event):
+        bbox = self._area_canvas.bbox("all")
+        if not bbox or bbox[3] <= self._area_canvas.winfo_height():
+            return  # nothing to scroll; don't jitter
+        delta = event.delta
+        if abs(delta) >= 120:  # Windows-style notches
+            delta = int(delta / 120)
+        self._area_canvas.yview_scroll(-delta, "units")
+
+
+class MappingRow:
+    """One source-column -> target-column mapping, with an optional delimiter."""
+
+    def __init__(self, app, parent, source_col="A", target_col="E",
+                 delim_enabled=False, delimiter=DEFAULT_DELIMITER):
+        self.app = app
+        self.source_col = tk.StringVar(value=source_col)
+        self.target_col = tk.StringVar(value=target_col)
+        self.delim_enabled = tk.BooleanVar(value=delim_enabled)
+        self.delimiter = tk.StringVar(value=delimiter)
+
+        self.frame = tk.Frame(parent, bg=BG_CARD)
+        self.frame.pack(fill="x", pady=3)
+
+        ttk.Label(self.frame, text="From").pack(side="left")
+        self.source_combo = ttk.Combobox(
+            self.frame, textvariable=self.source_col, width=18, values=app.source_columns
+        )
+        self.source_combo.pack(side="left", padx=(6, 8))
+
+        ttk.Label(self.frame, text="→  to").pack(side="left")
+        self.target_combo = ttk.Combobox(
+            self.frame, textvariable=self.target_col, width=6,
+            values=COLUMN_CHOICES, state="readonly",
+        )
+        self.target_combo.pack(side="left", padx=(6, 12))
+
+        self.delim_check = ttk.Checkbutton(
+            self.frame, text="extract after", variable=self.delim_enabled,
+            command=self._sync_delim_state,
+        )
+        self.delim_check.pack(side="left")
+
+        self.delim_entry = ttk.Entry(self.frame, textvariable=self.delimiter, width=12)
+        self.delim_entry.pack(side="left", padx=6)
+
+        for var in (self.source_col, self.target_col, self.delim_enabled, self.delimiter):
+            var.trace_add("write", app._schedule_refresh)
+
+        PillButton(
+            self.frame, "✕", command=self.remove, bg_page=BG_CARD,
+            fill=SECONDARY_BG, fill_active="#f3c9c9", fill_disabled=SECONDARY_BG,
+            fg=SECONDARY_FG, font=(FONT, 10, "bold"), padx=10, pady=6,
+        ).pack(side="right")
+
+        self._sync_delim_state()
+
+    def _sync_delim_state(self):
+        self.delim_entry.configure(
+            state="normal" if self.delim_enabled.get() else "disabled"
+        )
+
+    def remove(self):
+        self.app.remove_mapping(self)
+
+    def destroy(self):
+        self.frame.destroy()
+
+    def effective_delimiter(self) -> str:
+        return self.delimiter.get().strip() if self.delim_enabled.get() else ""
+
+
+class ColumnMapperApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("940x980")
+        # Keep enough height that the preview card can never be squeezed flat -
+        # it's the only expanding widget, so everything above it is fixed cost.
+        self.minsize(880, 860)
+        self.configure(bg=BG_MAIN)
+
+        self.source_path = tk.StringVar()
+        self.source_sheet = tk.StringVar()
+        self.skip_header = tk.BooleanVar(value=True)
+        self.target_path = tk.StringVar()
+        self.target_sheet = tk.StringVar()
+        self._target_scan_job = None
+
+        self.id_enabled = tk.BooleanVar(value=True)
+        self.id_prefix = tk.StringVar(value=DEFAULT_ID_PREFIX)
+        self.id_col = tk.StringVar(value=DEFAULT_ID_COL)
+
+        self.source_columns = list(COLUMN_CHOICES)
+        self.mappings = []
+        self._preview_rows = []
+
+        # Live-preview plumbing: a debounce handle plus caches so a refresh
+        # doesn't re-read the workbooks on every keystroke.
+        self._refresh_job = None
+        self._src_cache_key = None
+        self._src_cache_rows = None
+        self._tgt_cache_key = None
+        self._tgt_cache_nextid = 1
+
+        self._build_style()
+        self._build_ui()
+
+        # Start with the two mappings this tool originally hardcoded.
+        self.add_mapping("A", "E", False, DEFAULT_DELIMITER)
+        self.add_mapping("B", "F", True, DEFAULT_DELIMITER)
+
+    # ---------- Styling ----------
+    def _build_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("TFrame", background=BG_CARD)
+        style.configure("Main.TFrame", background=BG_MAIN)
+
+        style.configure(
+            "Card.TLabelframe",
+            background=BG_CARD,
+            bordercolor=BORDER,
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "Card.TLabelframe.Label",
+            background=BG_CARD,
+            foreground=TEXT_DARK,
+            font=(FONT, 12, "bold"),
+        )
+
+        style.configure("TLabel", background=BG_CARD, foreground=TEXT_DARK, font=(FONT, 11))
+        style.configure(
+            "Muted.TLabel", background=BG_CARD, foreground=TEXT_MUTED, font=(FONT, 10)
+        )
+        style.configure(
+            "Status.TLabel", background=BG_MAIN, foreground=SUCCESS, font=(FONT, 11, "bold")
+        )
+
+        style.configure("TEntry", fieldbackground="#ffffff", padding=6)
+        style.configure("TCombobox", fieldbackground="#ffffff", padding=4)
+        style.configure("TCheckbutton", background=BG_CARD, font=(FONT, 10))
+
+        style.configure(
+            "Treeview",
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            foreground=TEXT_DARK,
+            rowheight=26,
+            font=(FONT, 10),
+            borderwidth=0,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background="#eef1f7",
+            foreground=TEXT_DARK,
+            font=(FONT, 10, "bold"),
+            relief="flat",
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", ACCENT)],
+            foreground=[("selected", "white")],
+        )
+
+    # ---------- UI ----------
+    def _card(self, parent, title, expand=False):
+        """A card with a soft drop-shadow: a tinted frame peeking out bottom-right."""
+        wrap = tk.Frame(parent, bg=SHADOW)
+        wrap.pack(fill="both" if expand else "x", expand=expand, padx=14, pady=(0, 9))
+        card = ttk.LabelFrame(wrap, text=title, style="Card.TLabelframe")
+        card.pack(fill="both" if expand else "x", expand=expand, padx=(0, 3), pady=(0, 3))
+        return card
+
+    def _build_ui(self):
+        # Header banner
+        header = tk.Frame(self, bg=HEADER_BG)
+        header.pack(fill="x")
+
+        header_inner = tk.Frame(header, bg=HEADER_BG)
+        header_inner.pack(fill="x", padx=18, pady=12)
+
+        CircleBadge(header_inner, "🧭", diameter=48, bg_page=HEADER_BG, fill=ACCENT).pack(
+            side="left", padx=(0, 14)
+        )
+        title_col = tk.Frame(header_inner, bg=HEADER_BG)
+        title_col.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            title_col,
+            text=APP_TITLE,
+            bg=HEADER_BG,
+            fg=HEADER_FG,
+            font=(FONT, 20, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            title_col,
+            text="Map source columns  →  target columns  →  append to the chosen tab",
+            bg=HEADER_BG,
+            fg=HEADER_SUB_FG,
+            font=(FONT, 11),
+            anchor="w",
+        ).pack(fill="x", pady=(2, 0))
+
+        body = tk.Frame(self, bg=BG_MAIN)
+        body.pack(fill="both", expand=True)
+        tk.Frame(body, bg=BG_MAIN, height=8).pack(fill="x")
+
+        # Source
+        frame_src = self._card(body, "①  Source File")
+
+        row1 = ttk.Frame(frame_src)
+        row1.pack(fill="x", padx=12, pady=(9, 6))
+        ttk.Entry(row1, textvariable=self.source_path, width=55).pack(
+            side="left", fill="x", expand=True, padx=(0, 10)
+        )
+        PillButton(
+            row1, "Browse...", command=self.pick_source, bg_page=BG_CARD,
+            fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE, fill_disabled=SECONDARY_BG,
+            fg=SECONDARY_FG, font=(FONT, 11, "bold"),
+        ).pack(side="left")
+
+        row2 = ttk.Frame(frame_src)
+        row2.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Label(row2, text="Source tab:").pack(side="left")
+        self.source_sheet_combo = ttk.Combobox(
+            row2, textvariable=self.source_sheet, state="readonly", width=28
+        )
+        self.source_sheet_combo.pack(side="left", padx=8)
+        self.source_sheet_combo.bind("<<ComboboxSelected>>", self._on_source_sheet_change)
+        ttk.Checkbutton(
+            row2, text="First row is a header (skip it)", variable=self.skip_header
+        ).pack(side="left", padx=14)
+
+        # Target
+
+        frame_dst = self._card(body, "②  Target Workbook")
+
+        row3 = ttk.Frame(frame_dst)
+        row3.pack(fill="x", padx=12, pady=(9, 6))
+        ttk.Entry(row3, textvariable=self.target_path, width=55).pack(
+            side="left", fill="x", expand=True, padx=(0, 10)
+        )
+        PillButton(
+            row3, "Browse...", command=self.pick_target, bg_page=BG_CARD,
+            fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE, fill_disabled=SECONDARY_BG,
+            fg=SECONDARY_FG, font=(FONT, 11, "bold"),
+        ).pack(side="left")
+        PillButton(
+            row3, "New...", command=self.new_target, bg_page=BG_CARD,
+            fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE, fill_disabled=SECONDARY_BG,
+            fg=SECONDARY_FG, font=(FONT, 11), padx=14, pady=11,
+        ).pack(side="left", padx=(8, 0))
+
+        row4 = ttk.Frame(frame_dst)
+        row4.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Label(row4, text="Target tab:").pack(side="left")
+        self.target_sheet_combo = ttk.Combobox(
+            row4, textvariable=self.target_sheet, width=28
+        )
+        self.target_sheet_combo.pack(side="left", padx=8)
+        self.target_tabs_hint = ttk.Label(
+            row4, text="choose a target workbook first", style="Muted.TLabel"
+        )
+        self.target_tabs_hint.pack(side="left", padx=6)
+
+        ttk.Label(
+            frame_dst,
+            text="Browse edits the workbook in place; New… starts a fresh one.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Mappings
+        frame_map = self._card(body, "③  Column Mappings")
+
+        id_row = tk.Frame(frame_map, bg=BG_CARD)
+        id_row.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Checkbutton(
+            id_row, text="Auto ID", variable=self.id_enabled, command=self._on_id_toggle
+        ).pack(side="left")
+        ttk.Label(id_row, text="prefix").pack(side="left", padx=(12, 4))
+        self.id_prefix_entry = ttk.Entry(id_row, textvariable=self.id_prefix, width=8)
+        self.id_prefix_entry.pack(side="left")
+        ttk.Label(id_row, text="→  to").pack(side="left", padx=(12, 4))
+        self.id_col_combo = ttk.Combobox(
+            id_row, textvariable=self.id_col, width=6,
+            values=COLUMN_CHOICES, state="readonly",
+        )
+        self.id_col_combo.pack(side="left", padx=4)
+        ttk.Label(
+            id_row,
+            text=f"continues from the highest existing ID ({DEFAULT_ID_PREFIX}001, "
+            f"{DEFAULT_ID_PREFIX}002, ...)",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=10)
+
+        ttk.Separator(frame_map, orient="horizontal").pack(fill="x", padx=12, pady=6)
+
+        self.map_area = ScrollArea(frame_map, bg=BG_CARD, height=84)
+        self.map_area.pack(fill="x", padx=12, pady=(0, 6))
+
+        add_row = tk.Frame(frame_map, bg=BG_CARD)
+        add_row.pack(fill="x", padx=12, pady=(0, 12))
+        PillButton(
+            add_row, "+  Add mapping", command=lambda: self.add_mapping(),
+            bg_page=BG_CARD, fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE,
+            fill_disabled=SECONDARY_BG, fg=SECONDARY_FG, font=(FONT, 11, "bold"),
+            padx=16, pady=8,
+        ).pack(side="left")
+        ttk.Label(
+            add_row,
+            text="Tick “extract after” to trim a value; leave it off to copy the cell whole.",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=12)
+
+        # Actions
+        frame_actions = tk.Frame(body, bg=BG_MAIN)
+        frame_actions.pack(fill="x", padx=17, pady=(0, 9))
+        self.append_btn = PillButton(
+            frame_actions, "Append to Log", command=self.confirm_append,
+            bg_page=BG_MAIN, fill=ACCENT, fill_active=ACCENT_ACTIVE,
+            fill_disabled=ACCENT_DISABLED, fg="#ffffff", font=(FONT, 11, "bold"),
+        )
+        self.append_btn.pack(side="left")
+        self.append_btn.set_state("disabled")
+        ttk.Label(
+            frame_actions,
+            text="The preview below updates as you edit - it always shows exactly "
+            "what will be written.",
+            background=BG_MAIN,
+            foreground=TEXT_MUTED,
+            font=(FONT, 10),
+        ).pack(side="left", padx=14)
+
+        # Preview table
+        frame_preview = self._card(body, "Preview", expand=True)
+
+        tree_wrap = ttk.Frame(frame_preview)
+        tree_wrap.pack(fill="both", expand=True, padx=12, pady=12)
+
+        self.tree = ttk.Treeview(tree_wrap, columns=("placeholder",), show="headings", height=6)
+        self.tree.pack(fill="both", expand=True, side="left")
+
+        scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
+        scroll.pack(side="left", fill="y")
+        self.tree.configure(yscrollcommand=scroll.set)
+
+        self.tree.tag_configure("warn", background=WARN_BG)
+        self.tree.tag_configure("even", background=ROW_ALT)
+        self.tree.tag_configure("odd", background="#ffffff")
+
+        self._on_id_toggle()
+        self._rebuild_tree_columns()
+        self.target_path.trace_add("write", self._on_target_path_change)
+
+        for var in (
+            self.source_path, self.source_sheet, self.skip_header,
+            self.target_path, self.target_sheet,
+            self.id_enabled, self.id_prefix, self.id_col,
+        ):
+            var.trace_add("write", self._schedule_refresh)
+
+        # Status
+        self.status_badge = StatusBadge(body, bg_page=BG_MAIN, font=(FONT, 11))
+        self.status_badge.pack(padx=17, pady=(0, 10), anchor="w")
+
+    # ---------- Mapping management ----------
+    def add_mapping(self, source_col=None, target_col=None,
+                    delim_enabled=False, delimiter=DEFAULT_DELIMITER):
+        if source_col is None:
+            source_col = COLUMN_CHOICES[min(len(self.mappings), len(COLUMN_CHOICES) - 1)]
+        if target_col is None:
+            used = {m.target_col.get().strip().upper() for m in self.mappings}
+            if self.id_enabled.get():
+                used.add(self.id_col.get().strip().upper())
+            target_col = next((c for c in COLUMN_CHOICES if c not in used), "A")
+
+        row = MappingRow(
+            self, self.map_area.inner, source_col, target_col, delim_enabled, delimiter
+        )
+        self.mappings.append(row)
+        self._schedule_refresh()
+        return row
+
+    def remove_mapping(self, row):
+        if row not in self.mappings:
+            return
+        self.mappings.remove(row)
+        row.destroy()
+        self._schedule_refresh()
+
+    def _on_id_toggle(self):
+        state = "normal" if self.id_enabled.get() else "disabled"
+        self.id_prefix_entry.configure(state=state)
+        self.id_col_combo.configure(state="readonly" if self.id_enabled.get() else "disabled")
+        self._schedule_refresh()
+
+    def _on_source_sheet_change(self, _event=None):
+        """Relabel the source column dropdowns with row-1 values as hints."""
+        path = self.source_path.get().strip()
+        sheet = self.source_sheet.get().strip()
+        if not path or not sheet or not os.path.exists(path):
+            return
+        labels = list(COLUMN_CHOICES)
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb[sheet]
+            first = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            labels = []
+            for i, letter in enumerate(COLUMN_CHOICES):
+                head = first[i] if i < len(first) else None
+                head = str(head).strip() if head not in (None, "") else ""
+                labels.append(f"{letter} - {head}" if head else letter)
+            wb.close()
+        except Exception:
+            pass
+
+        self.source_columns = labels
+        for m in self.mappings:
+            current = parse_column(m.source_col.get())
+            m.source_combo["values"] = labels
+            if current and current <= len(labels):
+                m.source_col.set(labels[current - 1])
+
+    # ---------- Preview table columns ----------
+    def _rebuild_tree_columns(self):
+        if not hasattr(self, "tree"):
+            return
+
+        specs = []
+        if self.id_enabled.get():
+            specs.append(
+                ("__id", f"ID → {self.id_col.get().strip().upper()}", 90, "center")
+            )
+        for i, m in enumerate(self.mappings):
+            src = (parse_column(m.source_col.get()) or 0)
+            src_letter = get_column_letter(src) if src else "?"
+            tgt = m.target_col.get().strip().upper() or "?"
+            label = f"{src_letter} → {tgt}"
+            delim = m.effective_delimiter()
+            if delim:
+                label += f"  (after '{delim}')"
+            specs.append((f"m{i}", label, 200, "w"))
+        specs.append(("__note", "Note", 170, "w"))
+
+        self.tree.configure(columns=[s[0] for s in specs])
+        for key, text, width, anchor in specs:
+            self.tree.heading(key, text=text)
+            self.tree.column(key, width=width, anchor=anchor)
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+    # ---------- File pickers ----------
+    def pick_source(self):
+        path = filedialog.askopenfilename(
+            title="Select source Excel file",
+            filetypes=[("Excel files", "*.xlsx *.xlsm")],
+        )
+        if not path:
+            return
+        self.source_path.set(path)
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            sheets = wb.sheetnames
+            self.source_sheet_combo["values"] = sheets
+            if sheets:
+                self.source_sheet.set(sheets[0])
+            wb.close()
+            self._on_source_sheet_change()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read workbook:\n{e}")
+
+    def pick_target(self):
+        """Open an existing workbook to append into (the normal case)."""
+        path = filedialog.askopenfilename(
+            title="Select the existing target workbook",
+            filetypes=[("Excel files", "*.xlsx *.xlsm")],
+        )
+        if not path:
+            return
+        self.target_path.set(path)
+        self._load_target_sheets(path)
+
+    def new_target(self):
+        """Create a brand-new target workbook (only when you explicitly want one)."""
+        path = filedialog.asksaveasfilename(
+            title="Create a new target workbook",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+        )
+        if not path:
+            return
+        self.target_path.set(path)
+        self._load_target_sheets(path)
+
+    def _on_target_path_change(self, *_args):
+        """Rescan tabs whenever the target path changes - typed, pasted or browsed."""
+        if self._target_scan_job is not None:
+            self.after_cancel(self._target_scan_job)
+        self._target_scan_job = self.after(400, self._scan_target_sheets)
+
+    def _scan_target_sheets(self):
+        self._target_scan_job = None
+        self._load_target_sheets(self.target_path.get().strip(), announce=False)
+
+    def _load_target_sheets(self, path, announce=True):
+        """Populate the target tab dropdown from the workbook, if it exists.
+
+        `announce` controls whether read failures raise a dialog - browsing
+        should report problems, background rescans should stay quiet.
+        """
+        if not path:
+            self.target_sheet_combo["values"] = []
+            self.target_tabs_hint.configure(text="choose a target workbook first")
+            return
+
+        if not os.path.exists(path):
+            self.target_sheet_combo["values"] = []
+            self.target_tabs_hint.configure(
+                text="new file - type a tab name to create it"
+            )
+            return
+
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            sheets = list(wb.sheetnames)
+            wb.close()
+        except Exception as e:
+            self.target_sheet_combo["values"] = []
+            self.target_tabs_hint.configure(text="could not read this workbook")
+            if announce:
+                messagebox.showerror("Error", f"Could not read target workbook:\n{e}")
+            return
+
+        self.target_sheet_combo["values"] = sheets
+        self.target_tabs_hint.configure(
+            text=f"{len(sheets)} tab(s) in this file - or type a new name"
+        )
+        if sheets and self.target_sheet.get().strip() not in sheets:
+            self.target_sheet.set(sheets[0])
+
+    # ---------- Validation ----------
+    def _validate(self):
+        """Return (error_message, resolved_mappings) - error is None when valid."""
+        if not self.source_path.get().strip() or not self.source_sheet.get().strip():
+            return "Pick a source file and tab first.", None
+        if not self.target_path.get().strip():
+            return "Pick a target workbook first.", None
+        tab = self.target_sheet.get().strip()
+        if not tab:
+            return "Enter a target tab name.", None
+        bad = set(tab) & set(INVALID_SHEET_CHARS)
+        if bad:
+            return (
+                f"A tab name can't contain {' '.join(sorted(bad))} - "
+                "Excel doesn't allow it.",
+                None,
+            )
+        if len(tab) > MAX_SHEET_NAME:
+            return f"Tab names are limited to {MAX_SHEET_NAME} characters.", None
+        if not self.mappings:
+            return "Add at least one column mapping.", None
+
+        resolved = []
+        seen_targets = {}
+
+        if self.id_enabled.get():
+            if not self.id_prefix.get().strip():
+                return "The Auto ID prefix can't be blank.", None
+            id_idx = parse_column(self.id_col.get())
+            if not id_idx:
+                return f"'{self.id_col.get()}' isn't a valid ID column.", None
+            seen_targets[id_idx] = "the Auto ID"
+
+        for m in self.mappings:
+            src_idx = parse_column(m.source_col.get())
+            tgt_idx = parse_column(m.target_col.get())
+            if not src_idx:
+                return f"'{m.source_col.get()}' isn't a valid source column.", None
+            if not tgt_idx:
+                return f"'{m.target_col.get()}' isn't a valid target column.", None
+            if tgt_idx in seen_targets:
+                return (
+                    f"Target column {get_column_letter(tgt_idx)} is used by "
+                    f"{seen_targets[tgt_idx]} and another mapping. "
+                    "Each target column must be unique.",
+                    None,
+                )
+            seen_targets[tgt_idx] = f"the {get_column_letter(src_idx)} mapping"
+            resolved.append((src_idx, tgt_idx, m.effective_delimiter()))
+
+        return None, resolved
+
+    # ---------- Source / target reads (cached) ----------
+    def _source_rows(self):
+        """All source rows, cached until the file, tab, or mtime changes."""
+        path = self.source_path.get().strip()
+        sheet = self.source_sheet.get().strip()
+        if not path or not sheet or not os.path.exists(path):
+            return None
+        try:
+            key = (path, sheet, os.path.getmtime(path))
+        except OSError:
+            return None
+        if self._src_cache_key != key:
+            try:
+                wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+                if sheet not in wb.sheetnames:
+                    wb.close()
+                    return None
+                rows = [tuple(r) for r in wb[sheet].iter_rows(values_only=True)]
+                wb.close()
+            except Exception:
+                return None
+            self._src_cache_key = key
+            self._src_cache_rows = rows
+        return self._src_cache_rows
+
+    def _next_id_start(self):
+        """Next free ID number in the target tab, cached by file mtime."""
+        path = self.target_path.get().strip()
+        sheet = self.target_sheet.get().strip()
+        prefix = self.id_prefix.get().strip()
+        id_idx = parse_column(self.id_col.get())
+        if not (path and sheet and prefix and id_idx and os.path.exists(path)):
+            return 1
+        try:
+            key = (path, sheet, prefix, id_idx, os.path.getmtime(path))
+        except OSError:
+            return 1
+        if self._tgt_cache_key != key:
+            start = 1
+            try:
+                wb = openpyxl.load_workbook(path, data_only=True)
+                if sheet in wb.sheetnames:
+                    start = next_id_number(wb[sheet], prefix, id_idx)
+                wb.close()
+            except Exception:
+                start = 1
+            self._tgt_cache_key = key
+            self._tgt_cache_nextid = start
+        return self._tgt_cache_nextid
+
+    def _invalidate_caches(self):
+        self._src_cache_key = None
+        self._tgt_cache_key = None
+
+    # ---------- Live preview ----------
+    def _schedule_refresh(self, *_args):
+        """Debounce refreshes so typing doesn't re-read the workbooks per keystroke."""
+        if self._refresh_job is not None:
+            self.after_cancel(self._refresh_job)
+        self._refresh_job = self.after(250, self.refresh_preview)
+
+    def refresh_preview(self):
+        self._refresh_job = None
+        self._rebuild_tree_columns()
+        self._preview_rows = []
+
+        error, resolved = self._validate()
+        if error:
+            self.status_badge.set(error, WARNTEXT)
+            self.append_btn.set_state("disabled")
+            return
+
+        rows = self._source_rows()
+        if rows is None:
+            self.status_badge.set("Could not read the source tab.", ERROR)
+            self.append_btn.set_state("disabled")
+            return
+
+        if self.skip_header.get() and rows:
+            rows = rows[1:]
+
+        start_n = self._next_id_start() if self.id_enabled.get() else 1
+        max_src = max(src for src, _tgt, _d in resolved)
+        prefix = self.id_prefix.get().strip()
+        self._preview_rows = []
+        n = start_n
+        for raw in rows:
+            cells = [raw[i] if i < len(raw) else None for i in range(max_src)]
+            if all(c in (None, "") for c in cells):
+                continue  # fully blank row
+
+            values = []
+            notes = []
+            for src_idx, _tgt_idx, delim in resolved:
+                raw_val = cells[src_idx - 1]
+                extracted = extract_after_delimiter(raw_val, delim)
+                values.append(extracted)
+                letter = get_column_letter(src_idx)
+                if raw_val in (None, ""):
+                    notes.append(f"{letter} empty")
+                elif delim and not extracted:
+                    notes.append(f"{letter}: '{delim}' not found")
+
+            id_str = f"{prefix}{n:0{ID_PAD}d}" if self.id_enabled.get() else None
+            self._preview_rows.append((id_str, values, "; ".join(notes)))
+            n += 1
+
+        for i, (id_str, values, note) in enumerate(self._preview_rows):
+            display = ([id_str] if self.id_enabled.get() else []) + values + [note]
+            if note:
+                tags = ("warn",)
+            else:
+                tags = ("even",) if i % 2 == 0 else ("odd",)
+            self.tree.insert("", "end", values=display, tags=tags)
+
+        if not self._preview_rows:
+            self.status_badge.set("No data rows found to map.", ERROR)
+            self.append_btn.set_state("disabled")
+            return
+
+        warn_count = sum(1 for r in self._preview_rows if r[2])
+        id_note = ""
+        if self.id_enabled.get():
+            id_note = f"IDs {self._preview_rows[0][0]}-{self._preview_rows[-1][0]}. "
+        self.status_badge.set(
+            (
+                f"{len(self._preview_rows)} row(s) ready across "
+                f"{len(resolved)} mapping(s). {id_note}"
+                f"{warn_count} row(s) flagged."
+            ),
+            (WARNTEXT if warn_count else SUCCESS),
+        )
+        self.append_btn.set_state("normal")
+
+    def confirm_append(self):
+        # Recompute from current settings so what gets written always matches
+        # what's on screen, even if the workbooks changed underneath us.
+        self._invalidate_caches()
+        self.refresh_preview()
+
+        if not self._preview_rows:
+            messagebox.showwarning(
+                "Nothing to append", "There are no rows to write - check the preview."
+            )
+            return
+
+        error, resolved = self._validate()
+        if error:
+            messagebox.showwarning("Check the settings", error)
+            return
+
+        tgt_path = self.target_path.get().strip()
+        tgt_sheet = self.target_sheet.get().strip()
+
+        try:
+            if os.path.exists(tgt_path):
+                # Open the existing workbook and edit it in place - never replace it.
+                # keep_vba preserves macros in .xlsm, which openpyxl drops otherwise.
+                is_macro = os.path.splitext(tgt_path)[1].lower() == ".xlsm"
+                tgt_wb = openpyxl.load_workbook(tgt_path, keep_vba=is_macro)
+            else:
+                tgt_wb = openpyxl.Workbook()
+                default_sheet = tgt_wb.active
+                if default_sheet.title != tgt_sheet:
+                    tgt_wb.remove(default_sheet)
+
+            if tgt_sheet in tgt_wb.sheetnames:
+                ws = tgt_wb[tgt_sheet]
+            else:
+                ws = tgt_wb.create_sheet(tgt_sheet)
+                if self.id_enabled.get():
+                    ws.cell(row=1, column=parse_column(self.id_col.get()), value="ID")
+                for src_idx, tgt_idx, _delim in resolved:
+                    ws.cell(
+                        row=1, column=tgt_idx,
+                        value=f"Column {get_column_letter(src_idx)}",
+                    )
+
+            start_row = last_used_row(ws) + 1
+            if start_row < 2:
+                start_row = 2  # never write into the header row
+
+            id_idx = parse_column(self.id_col.get()) if self.id_enabled.get() else None
+
+            for i, (id_str, values, _note) in enumerate(self._preview_rows):
+                r = start_row + i
+                if id_idx:
+                    ws.cell(row=r, column=id_idx, value=id_str)
+                for (_src_idx, tgt_idx, _delim), value in zip(resolved, values):
+                    ws.cell(row=r, column=tgt_idx, value=value)
+
+            tgt_wb.save(tgt_path)
+
+            self.status_badge.set(
+                f"Appended {len(self._preview_rows)} row(s) to '{tgt_sheet}' in {tgt_path}.",
+                SUCCESS,
+            )
+            messagebox.showinfo(
+                "Done",
+                f"Appended {len(self._preview_rows)} row(s) to '{tgt_sheet}'.",
+            )
+            self._invalidate_caches()
+            self._schedule_refresh()
+
+        except PermissionError:
+            messagebox.showerror(
+                "File is locked",
+                "Could not save the target workbook - it looks like it's open in "
+                "Excel.\n\nClose the file there and click Confirm again. Nothing "
+                "has been written yet.",
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not append to target workbook:\n{e}")
+
+
+if __name__ == "__main__":
+    app = ColumnMapperApp()
+    app.mainloop()
