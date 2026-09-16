@@ -27,13 +27,17 @@ Or double-click `Launch Excel Column Mapper.command`.
 **Column mappings** — the core of the app. Each mapping is one row:
 
 ```
-From [ A - Server ]  →  to [ E ]   ☐ extract after [        ]   ✕
+From [ A - Server ]  →  to [ E - Server Name ]   ☐ extract after [        ]   ✕
 ```
 
 - **From** — the source column. The dropdown shows row 1's value as a hint
   (e.g. `A - Server`), so you can pick by header name rather than counting
   letters.
-- **to** — the target column the value is written to.
+- **to** — the target column the value is written to. With **First row is a
+  header** ticked on the target workbook, this dropdown is labelled from the
+  target tab's own header row too (e.g. `E - Server Name`), so both sides of a
+  mapping read by name. Untick it — or pick a tab with no header row — and it
+  falls back to plain column letters.
 - **extract after** — optional. Tick it and enter a delimiter to keep only the
   text *after* that delimiter; leave it unticked to copy the cell whole.
 - **✕** — removes that mapping.
@@ -48,7 +52,8 @@ treated as literal text, so regex characters like `.` behave as typed. If the
 delimiter isn't found in a row, that cell is left empty and the row is flagged.
 
 **Auto ID** (optional) writes an incrementing `FS001`, `FS002`, ... into a target
-column of your choice. Both the prefix and the column are configurable, and it
+column of your choice — its dropdown is header-labelled the same way. Both the
+prefix and the column are configurable, and it
 continues from the highest existing ID already in that column. Untick **Auto ID**
 to skip it entirely.
 

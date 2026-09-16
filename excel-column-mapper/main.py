@@ -340,8 +340,8 @@ class MappingRow:
 
         ttk.Label(self.frame, text="→  to").pack(side="left")
         self.target_combo = ttk.Combobox(
-            self.frame, textvariable=self.target_col, width=6,
-            values=COLUMN_CHOICES, state="readonly",
+            self.frame, textvariable=self.target_col, width=18,
+            values=app.target_columns, state="readonly",
         )
         self.target_combo.pack(side="left", padx=(6, 12))
 
@@ -395,6 +395,7 @@ class ColumnMapperApp(tk.Tk):
         self.skip_header = tk.BooleanVar(value=True)
         self.target_path = tk.StringVar()
         self.target_sheet = tk.StringVar()
+        self.target_has_header = tk.BooleanVar(value=True)
         self._target_scan_job = None
 
         self.id_enabled = tk.BooleanVar(value=True)
@@ -402,6 +403,7 @@ class ColumnMapperApp(tk.Tk):
         self.id_col = tk.StringVar(value=DEFAULT_ID_COL)
 
         self.source_columns = list(COLUMN_CHOICES)
+        self.target_columns = list(COLUMN_CHOICES)
         self.mappings = []
         self._preview_rows = []
 
@@ -575,6 +577,9 @@ class ColumnMapperApp(tk.Tk):
             row4, textvariable=self.target_sheet, width=28
         )
         self.target_sheet_combo.pack(side="left", padx=8)
+        ttk.Checkbutton(
+            row4, text="First row is a header", variable=self.target_has_header
+        ).pack(side="left", padx=10)
         self.target_tabs_hint = ttk.Label(
             row4, text="choose a target workbook first", style="Muted.TLabel"
         )
@@ -599,8 +604,8 @@ class ColumnMapperApp(tk.Tk):
         self.id_prefix_entry.pack(side="left")
         ttk.Label(id_row, text="→  to").pack(side="left", padx=(12, 4))
         self.id_col_combo = ttk.Combobox(
-            id_row, textvariable=self.id_col, width=6,
-            values=COLUMN_CHOICES, state="readonly",
+            id_row, textvariable=self.id_col, width=18,
+            values=self.target_columns, state="readonly",
         )
         self.id_col_combo.pack(side="left", padx=4)
         ttk.Label(
@@ -671,10 +676,14 @@ class ColumnMapperApp(tk.Tk):
 
         for var in (
             self.source_path, self.source_sheet, self.skip_header,
-            self.target_path, self.target_sheet,
+            self.target_path, self.target_sheet, self.target_has_header,
             self.id_enabled, self.id_prefix, self.id_col,
         ):
             var.trace_add("write", self._schedule_refresh)
+
+        self.source_path.trace_add("write", self._on_source_sheet_change)
+        for var in (self.target_sheet, self.target_has_header):
+            var.trace_add("write", self._on_target_sheet_change)
 
         # Status
         self.status_badge = StatusBadge(body, bg_page=BG_MAIN, font=(FONT, 11))
@@ -684,12 +693,21 @@ class ColumnMapperApp(tk.Tk):
     def add_mapping(self, source_col=None, target_col=None,
                     delim_enabled=False, delimiter=DEFAULT_DELIMITER):
         if source_col is None:
-            source_col = COLUMN_CHOICES[min(len(self.mappings), len(COLUMN_CHOICES) - 1)]
+            nth = min(len(self.mappings), len(self.source_columns) - 1)
+            source_col = self.source_columns[nth]
         if target_col is None:
-            used = {m.target_col.get().strip().upper() for m in self.mappings}
+            used = {
+                idx for idx in (parse_column(m.target_col.get()) for m in self.mappings)
+                if idx
+            }
             if self.id_enabled.get():
-                used.add(self.id_col.get().strip().upper())
-            target_col = next((c for c in COLUMN_CHOICES if c not in used), "A")
+                id_idx = parse_column(self.id_col.get())
+                if id_idx:
+                    used.add(id_idx)
+            free = next(
+                (i for i in range(1, len(self.target_columns) + 1) if i not in used), 1
+            )
+            target_col = self.target_columns[free - 1]
 
         row = MappingRow(
             self, self.map_area.inner, source_col, target_col, delim_enabled, delimiter
@@ -711,48 +729,78 @@ class ColumnMapperApp(tk.Tk):
         self.id_col_combo.configure(state="readonly" if self.id_enabled.get() else "disabled")
         self._schedule_refresh()
 
-    def _on_source_sheet_change(self, _event=None):
-        """Relabel the source column dropdowns with row-1 values as hints."""
-        path = self.source_path.get().strip()
-        sheet = self.source_sheet.get().strip()
+    def _column_labels(self, path, sheet):
+        """Build ['A - Server', 'B', ...] from row 1 of a sheet.
+
+        Falls back to bare column letters if the file, tab, or row is
+        unreadable, so the dropdowns always have usable values.
+        """
         if not path or not sheet or not os.path.exists(path):
-            return
-        labels = list(COLUMN_CHOICES)
+            return list(COLUMN_CHOICES)
         try:
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-            ws = wb[sheet]
-            first = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
-            labels = []
-            for i, letter in enumerate(COLUMN_CHOICES):
-                head = first[i] if i < len(first) else None
-                head = str(head).strip() if head not in (None, "") else ""
-                labels.append(f"{letter} - {head}" if head else letter)
+            if sheet not in wb.sheetnames:
+                wb.close()
+                return list(COLUMN_CHOICES)
+            first = next(wb[sheet].iter_rows(min_row=1, max_row=1, values_only=True), ())
             wb.close()
         except Exception:
-            pass
+            return list(COLUMN_CHOICES)
 
+        labels = []
+        for i, letter in enumerate(COLUMN_CHOICES):
+            head = first[i] if i < len(first) else None
+            head = str(head).strip() if head not in (None, "") else ""
+            labels.append(f"{letter} - {head}" if head else letter)
+        return labels
+
+    @staticmethod
+    def _relabel(combo, var, labels):
+        """Swap a column dropdown's labels, keeping it pointed at the same column."""
+        current = parse_column(var.get())
+        combo["values"] = labels
+        if current and current <= len(labels):
+            var.set(labels[current - 1])
+
+    def _on_source_sheet_change(self, *_args):
+        """Relabel the source column dropdowns with row-1 values as hints."""
+        labels = self._column_labels(
+            self.source_path.get().strip(), self.source_sheet.get().strip()
+        )
         self.source_columns = labels
         for m in self.mappings:
-            current = parse_column(m.source_col.get())
-            m.source_combo["values"] = labels
-            if current and current <= len(labels):
-                m.source_col.set(labels[current - 1])
+            self._relabel(m.source_combo, m.source_col, labels)
+
+    def _on_target_sheet_change(self, *_args):
+        """Relabel the target column dropdowns from the target tab's header row."""
+        if self.target_has_header.get():
+            labels = self._column_labels(
+                self.target_path.get().strip(), self.target_sheet.get().strip()
+            )
+        else:
+            labels = list(COLUMN_CHOICES)
+
+        self.target_columns = labels
+        for m in self.mappings:
+            self._relabel(m.target_combo, m.target_col, labels)
+        self._relabel(self.id_col_combo, self.id_col, labels)
 
     # ---------- Preview table columns ----------
     def _rebuild_tree_columns(self):
         if not hasattr(self, "tree"):
             return
 
+        def letter(value):
+            idx = parse_column(value)
+            return get_column_letter(idx) if idx else "?"
+
         specs = []
         if self.id_enabled.get():
             specs.append(
-                ("__id", f"ID → {self.id_col.get().strip().upper()}", 90, "center")
+                ("__id", f"ID → {letter(self.id_col.get())}", 90, "center")
             )
         for i, m in enumerate(self.mappings):
-            src = (parse_column(m.source_col.get()) or 0)
-            src_letter = get_column_letter(src) if src else "?"
-            tgt = m.target_col.get().strip().upper() or "?"
-            label = f"{src_letter} → {tgt}"
+            label = f"{letter(m.source_col.get())} → {letter(m.target_col.get())}"
             delim = m.effective_delimiter()
             if delim:
                 label += f"  (after '{delim}')"
@@ -855,6 +903,7 @@ class ColumnMapperApp(tk.Tk):
         )
         if sheets and self.target_sheet.get().strip() not in sheets:
             self.target_sheet.set(sheets[0])
+        self._on_target_sheet_change()
 
     # ---------- Validation ----------
     def _validate(self):
