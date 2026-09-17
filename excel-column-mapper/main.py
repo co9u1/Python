@@ -48,6 +48,9 @@ MAX_SHEET_NAME = 31
 # Appended rows copy their formatting from this row of the target tab.
 STYLE_TEMPLATE_ROW = 2
 
+# How often to report progress (in rows) while writing a large append.
+PROGRESS_EVERY = 2000
+
 COLUMN_CHOICES = [get_column_letter(i) for i in range(1, 41)]  # A..AN
 
 
@@ -108,33 +111,25 @@ def row_style_template(ws):
     if ws.max_row < STYLE_TEMPLATE_ROW or not ws.max_column:
         return None
 
-    template = []
-    for col in range(1, ws.max_column + 1):
-        cell = ws.cell(row=STYLE_TEMPLATE_ROW, column=col)
-        template.append({
-            "font": copy(cell.font),
-            "fill": copy(cell.fill),
-            "border": copy(cell.border),
-            "alignment": copy(cell.alignment),
-            "protection": copy(cell.protection),
-            "number_format": cell.number_format,
-        })
+    # A cell's formatting is a StyleArray of indices into the workbook's
+    # shared style tables. Copying that small array reuses the registered
+    # styles; copying font/fill/border objects per cell instead is orders of
+    # magnitude slower and defeats openpyxl's style interning entirely.
+    styles = [
+        ws.cell(row=STYLE_TEMPLATE_ROW, column=col)._style
+        for col in range(1, ws.max_column + 1)
+    ]
     height = ws.row_dimensions[STYLE_TEMPLATE_ROW].height
-    return {"cells": template, "height": height}
+    return {"styles": styles, "height": height}
 
 
 def apply_row_style(ws, row_idx, template):
     """Paint a snapshotted row format onto every column of `row_idx`."""
     if not template:
         return
-    for col, style in enumerate(template["cells"], start=1):
-        cell = ws.cell(row=row_idx, column=col)
-        cell.font = copy(style["font"])
-        cell.fill = copy(style["fill"])
-        cell.border = copy(style["border"])
-        cell.alignment = copy(style["alignment"])
-        cell.protection = copy(style["protection"])
-        cell.number_format = style["number_format"]
+    for col, style in enumerate(template["styles"], start=1):
+        if style is not None:
+            ws.cell(row=row_idx, column=col)._style = copy(style)
     if template["height"] is not None:
         ws.row_dimensions[row_idx].height = template["height"]
 
@@ -400,7 +395,7 @@ class MappingRow:
         self.delim_entry.pack(side="left", padx=6)
 
         for var in (self.source_col, self.target_col, self.delim_enabled, self.delimiter):
-            var.trace_add("write", app._schedule_refresh)
+            var.trace_add("write", app.schedule_refresh)
 
         PillButton(
             self.frame, "✕", command=self.remove, bg_page=BG_CARD,
@@ -504,7 +499,7 @@ class LookupRow:
 
         for var in (self.source_col, self.key_col, self.val_col,
                     self.target_col, self.fallback):
-            var.trace_add("write", app._schedule_refresh)
+            var.trace_add("write", app.schedule_refresh)
         for var in (self.path, self.sheet):
             var.trace_add("write", self._on_file_change)
 
@@ -532,11 +527,11 @@ class LookupRow:
             self.sheet.set(sheets[0])
             return  # setting sheet re-enters this handler
 
-        labels = self.app._column_labels(path, self.sheet.get().strip())
+        labels = self.app.column_labels(path, self.sheet.get().strip())
         self.lookup_columns = labels
-        self.app._relabel(self.key_combo, self.key_col, labels)
-        self.app._relabel(self.val_combo, self.val_col, labels)
-        self.app._schedule_refresh()
+        self.app.relabel(self.key_combo, self.key_col, labels)
+        self.app.relabel(self.val_combo, self.val_col, labels)
+        self.app.schedule_refresh()
 
     def remove(self):
         self.app.remove_lookup(self)
@@ -813,7 +808,7 @@ class ColumnMapperApp(tk.Tk):
         add_row = tk.Frame(frame_map, bg=BG_CARD)
         add_row.pack(fill="x", padx=12, pady=(0, 12))
         PillButton(
-            add_row, "+  Add mapping", command=lambda: self.add_mapping(),
+            add_row, "+  Add mapping", command=self.add_mapping,
             bg_page=BG_CARD, fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE,
             fill_disabled=SECONDARY_BG, fg=SECONDARY_FG, font=(FONT, 11, "bold"),
             padx=16, pady=8,
@@ -896,9 +891,10 @@ class ColumnMapperApp(tk.Tk):
             self.target_path, self.target_sheet, self.target_has_header,
             self.id_enabled, self.id_prefix, self.id_col,
         ):
-            var.trace_add("write", self._schedule_refresh)
+            var.trace_add("write", self.schedule_refresh)
 
-        self.source_path.trace_add("write", self._on_source_sheet_change)
+        for var in (self.source_path, self.source_sheet):
+            var.trace_add("write", self._on_source_sheet_change)
         for var in (self.target_sheet, self.target_has_header):
             var.trace_add("write", self._on_target_sheet_change)
 
@@ -930,7 +926,7 @@ class ColumnMapperApp(tk.Tk):
             self, self.map_area.inner, source_col, target_col, delim_enabled, delimiter
         )
         self.mappings.append(row)
-        self._schedule_refresh()
+        self.schedule_refresh()
         return row
 
     def remove_mapping(self, row):
@@ -938,13 +934,13 @@ class ColumnMapperApp(tk.Tk):
             return
         self.mappings.remove(row)
         row.destroy()
-        self._schedule_refresh()
+        self.schedule_refresh()
 
     # ---------- Lookup management ----------
     def add_lookup(self):
         row = LookupRow(self, self.lookup_area.inner)
         self.lookups.append(row)
-        self._schedule_refresh()
+        self.schedule_refresh()
         return row
 
     def remove_lookup(self, row):
@@ -952,7 +948,7 @@ class ColumnMapperApp(tk.Tk):
             return
         self.lookups.remove(row)
         row.destroy()
-        self._schedule_refresh()
+        self.schedule_refresh()
 
     def _lookup_table(self, path, sheet, key_idx, val_idx):
         """Build {normalised key: value} from a lookup sheet, cached by mtime.
@@ -994,9 +990,9 @@ class ColumnMapperApp(tk.Tk):
         state = "normal" if self.id_enabled.get() else "disabled"
         self.id_prefix_entry.configure(state=state)
         self.id_col_combo.configure(state="readonly" if self.id_enabled.get() else "disabled")
-        self._schedule_refresh()
+        self.schedule_refresh()
 
-    def _column_labels(self, path, sheet):
+    def column_labels(self, path, sheet):
         """Build ['A - Server', 'B', ...] from row 1 of a sheet.
 
         Falls back to bare column letters if the file, tab, or row is
@@ -1022,7 +1018,7 @@ class ColumnMapperApp(tk.Tk):
         return labels
 
     @staticmethod
-    def _relabel(combo, var, labels):
+    def relabel(combo, var, labels):
         """Swap a column dropdown's labels, keeping it pointed at the same column."""
         current = parse_column(var.get())
         combo["values"] = labels
@@ -1031,19 +1027,19 @@ class ColumnMapperApp(tk.Tk):
 
     def _on_source_sheet_change(self, *_args):
         """Relabel the source column dropdowns with row-1 values as hints."""
-        labels = self._column_labels(
+        labels = self.column_labels(
             self.source_path.get().strip(), self.source_sheet.get().strip()
         )
         self.source_columns = labels
         for m in self.mappings:
-            self._relabel(m.source_combo, m.source_col, labels)
+            self.relabel(m.source_combo, m.source_col, labels)
         for lk in self.lookups:
-            self._relabel(lk.source_combo, lk.source_col, labels)
+            self.relabel(lk.source_combo, lk.source_col, labels)
 
     def _on_target_sheet_change(self, *_args):
         """Relabel the target column dropdowns from the target tab's header row."""
         if self.target_has_header.get():
-            labels = self._column_labels(
+            labels = self.column_labels(
                 self.target_path.get().strip(), self.target_sheet.get().strip()
             )
         else:
@@ -1051,10 +1047,10 @@ class ColumnMapperApp(tk.Tk):
 
         self.target_columns = labels
         for m in self.mappings:
-            self._relabel(m.target_combo, m.target_col, labels)
+            self.relabel(m.target_combo, m.target_col, labels)
         for lk in self.lookups:
-            self._relabel(lk.target_combo, lk.target_col, labels)
-        self._relabel(self.id_col_combo, self.id_col, labels)
+            self.relabel(lk.target_combo, lk.target_col, labels)
+        self.relabel(self.id_col_combo, self.id_col, labels)
 
     # ---------- Preview table columns ----------
     def _rebuild_tree_columns(self):
@@ -1345,7 +1341,7 @@ class ColumnMapperApp(tk.Tk):
         self._lookup_cache.clear()
 
     # ---------- Live preview ----------
-    def _schedule_refresh(self, *_args):
+    def schedule_refresh(self, *_args):
         """Debounce refreshes so typing doesn't re-read the workbooks per keystroke."""
         if self._refresh_job is not None:
             self.after_cancel(self._refresh_job)
@@ -1461,6 +1457,14 @@ class ColumnMapperApp(tk.Tk):
         tgt_path = self.target_path.get().strip()
         tgt_sheet = self.target_sheet.get().strip()
 
+        # Writing a large sheet takes seconds and blocks the event loop. Show
+        # what's happening and keep the window responsive, or macOS flags the
+        # app as not responding and the user force-quits mid-write.
+        total = len(self._preview_rows)
+        self.append_btn.set_state("disabled")
+        self.status_badge.set(f"Opening the target workbook ({total} row(s))...", WARNTEXT)
+        self.update()
+
         try:
             if os.path.exists(tgt_path):
                 # Open the existing workbook and edit it in place - never replace it.
@@ -1488,8 +1492,7 @@ class ColumnMapperApp(tk.Tk):
                     ws.cell(row=1, column=step["tgt"], value=heading)
 
             start_row = last_used_row(ws) + 1
-            if start_row < 2:
-                start_row = 2  # never write into the header row
+            start_row = max(start_row, 2)  # never write into the header row
 
             # Snapshot before writing, while row 2 is still the last styled
             # row we know about.
@@ -1504,7 +1507,12 @@ class ColumnMapperApp(tk.Tk):
                     ws.cell(row=r, column=id_idx, value=id_str)
                 for step, value in zip(plan, values):
                     ws.cell(row=r, column=step["tgt"], value=value)
+                if i and i % PROGRESS_EVERY == 0:
+                    self.status_badge.set(f"Writing row {i:,} of {total:,}...", WARNTEXT)
+                    self.update()
 
+            self.status_badge.set(f"Saving {total:,} row(s)...", WARNTEXT)
+            self.update()
             tgt_wb.save(tgt_path)
 
             self.status_badge.set(
@@ -1516,7 +1524,7 @@ class ColumnMapperApp(tk.Tk):
                 f"Appended {len(self._preview_rows)} row(s) to '{tgt_sheet}'.",
             )
             self._invalidate_caches()
-            self._schedule_refresh()
+            self.schedule_refresh()
 
         except PermissionError:
             messagebox.showerror(
@@ -1529,6 +1537,9 @@ class ColumnMapperApp(tk.Tk):
             messagebox.showerror("Error", f"Could not append to target workbook:\n{e}")
 
 
+def main():
+    ColumnMapperApp().mainloop()
+
+
 if __name__ == "__main__":
-    app = ColumnMapperApp()
-    app.mainloop()
+    main()

@@ -1,0 +1,24 @@
+[MAIN]
+# openpyxl exposes a cell's packed style indices only as cell._style. Copying
+# that array is the supported-in-practice way to clone formatting quickly;
+# copying font/fill/border objects per cell is orders of magnitude slower.
+disable =
+    too-many-lines,
+    too-many-ancestors,
+    too-many-instance-attributes,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-statements,
+    too-many-branches,
+    too-many-return-statements,
+    broad-exception-caught,
+    protected-access,
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+    invalid-name,
+    line-too-long
+
+[FORMAT]
+max-line-length = 100
