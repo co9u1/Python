@@ -96,6 +96,17 @@ is written only when the tab is created.
 **Appending** — rows are always appended; existing rows are never touched or
 overwritten.
 
+**Matching the sheet's formatting** — openpyxl writes unstyled cells, so
+appended rows would otherwise stand out against a formatted log. With **Match
+the formatting of row 2** ticked (the default), every appended row copies row
+2's font, fill, borders, alignment, number format, and row height. Row 2 is the
+first data row under the header, so it's the natural template.
+
+Formatting is copied across the **full width** of row 2, including columns you
+haven't mapped, so banded fills and borders stay unbroken. If the target tab has
+no row 2 yet — a tab the app just created, or one with only headers — appended
+rows simply keep default formatting.
+
 > **Note on formatting:** saving goes through `openpyxl`, which rebuilds the
 > workbook file. Cell values, formulas, and sheet structure survive, and macros
 > are preserved in `.xlsm` files. Charts, images, and pivot tables are *not*

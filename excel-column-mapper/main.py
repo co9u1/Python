@@ -26,6 +26,7 @@ tables do not.
 
 import os
 import re
+from copy import copy
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -43,6 +44,9 @@ ID_PAD = 3
 # Excel's own limits on worksheet names.
 INVALID_SHEET_CHARS = "[]:*?/\\"
 MAX_SHEET_NAME = 31
+
+# Appended rows copy their formatting from this row of the target tab.
+STYLE_TEMPLATE_ROW = 2
 
 COLUMN_CHOICES = [get_column_letter(i) for i in range(1, 41)]  # A..AN
 
@@ -92,6 +96,47 @@ def next_id_number(ws, prefix: str, col_idx: int) -> int:
         if m:
             max_n = max(max_n, int(m.group(1)))
     return max_n + 1
+
+
+def row_style_template(ws):
+    """Snapshot row 2's formatting so appended rows can match the sheet.
+
+    Row 2 is the first data row under the header. Returns None when the
+    sheet has no such row yet (a tab the app just created, for example),
+    in which case appended rows are left with default formatting.
+    """
+    if ws.max_row < STYLE_TEMPLATE_ROW or not ws.max_column:
+        return None
+
+    template = []
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=STYLE_TEMPLATE_ROW, column=col)
+        template.append({
+            "font": copy(cell.font),
+            "fill": copy(cell.fill),
+            "border": copy(cell.border),
+            "alignment": copy(cell.alignment),
+            "protection": copy(cell.protection),
+            "number_format": cell.number_format,
+        })
+    height = ws.row_dimensions[STYLE_TEMPLATE_ROW].height
+    return {"cells": template, "height": height}
+
+
+def apply_row_style(ws, row_idx, template):
+    """Paint a snapshotted row format onto every column of `row_idx`."""
+    if not template:
+        return
+    for col, style in enumerate(template["cells"], start=1):
+        cell = ws.cell(row=row_idx, column=col)
+        cell.font = copy(style["font"])
+        cell.fill = copy(style["fill"])
+        cell.border = copy(style["border"])
+        cell.alignment = copy(style["alignment"])
+        cell.protection = copy(style["protection"])
+        cell.number_format = style["number_format"]
+    if template["height"] is not None:
+        ws.row_dimensions[row_idx].height = template["height"]
 
 
 def last_used_row(ws) -> int:
@@ -516,6 +561,7 @@ class ColumnMapperApp(tk.Tk):
         self.target_path = tk.StringVar()
         self.target_sheet = tk.StringVar()
         self.target_has_header = tk.BooleanVar(value=True)
+        self.copy_format = tk.BooleanVar(value=True)
         self._target_scan_job = None
 
         self.id_enabled = tk.BooleanVar(value=True)
@@ -715,6 +761,19 @@ class ColumnMapperApp(tk.Tk):
             row4, text="choose a target workbook first", style="Muted.TLabel"
         )
         self.target_tabs_hint.pack(side="left", padx=6)
+
+        row5 = ttk.Frame(frame_dst)
+        row5.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Checkbutton(
+            row5,
+            text=f"Match the formatting of row {STYLE_TEMPLATE_ROW}",
+            variable=self.copy_format,
+        ).pack(side="left")
+        ttk.Label(
+            row5,
+            text="appended rows copy that row's font, fill, borders and number format",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=8)
 
         ttk.Label(
             frame_dst,
@@ -1432,10 +1491,15 @@ class ColumnMapperApp(tk.Tk):
             if start_row < 2:
                 start_row = 2  # never write into the header row
 
+            # Snapshot before writing, while row 2 is still the last styled
+            # row we know about.
+            template = row_style_template(ws) if self.copy_format.get() else None
+
             id_idx = parse_column(self.id_col.get()) if self.id_enabled.get() else None
 
             for i, (id_str, values, _note) in enumerate(self._preview_rows):
                 r = start_row + i
+                apply_row_style(ws, r, template)
                 if id_idx:
                     ws.cell(row=r, column=id_idx, value=id_str)
                 for step, value in zip(plan, values):
