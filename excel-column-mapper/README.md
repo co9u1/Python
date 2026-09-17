@@ -24,6 +24,9 @@ Or double-click `Launch Excel Column Mapper.command`.
 
 ## How it works
 
+Configuration is split across three tabs — **Files**, **Column Mappings**, and
+**Lookups** — with the live preview always visible underneath.
+
 **Column mappings** — the core of the app. Each mapping is one row:
 
 ```
@@ -50,6 +53,29 @@ fileshare-audit workflow.
 so `/vol/` matches both `/vol/finance` and `\vol\finance`. The delimiter is
 treated as literal text, so regex characters like `.` behave as typed. If the
 delimiter isn't found in a row, that cell is left empty and the row is flagged.
+
+**Lookups** (the **Lookups** tab) pull a value from a *third* workbook — a
+VLOOKUP. Use this when the source file has one piece of information and the
+target needs a related one that lives in a reference table. Each lookup is:
+
+```
+Lookup file [ sites.xlsx ] [Browse…]   tab [ Sites ]              ✕
+Key from source [ A - Server ]  match on [ A - Server Name ]  return [ B - Site ]
+Write result to [ G - Site ]   if no match, write [ UNKNOWN ]
+```
+
+- **Key from source** — the source column whose value is looked up.
+- **match on** / **return** — the key and value columns *in the lookup file*.
+  Both dropdowns are labelled from that file's header row.
+- **Write result to** — the target column the result lands in.
+- **if no match** — optional fallback text. Leave it blank to write nothing.
+
+Matching **ignores case and surrounding whitespace**, so `SRV-NAS02 ` matches
+`srv-nas02`. If the lookup file has duplicate keys, the first one wins, the same
+as VLOOKUP. Unmatched rows are flagged yellow in the preview with a note naming
+the value that didn't match.
+
+Add as many lookups as you need; each gets its own file, tab, and columns.
 
 **Auto ID** (optional) writes an incrementing `FS001`, `FS002`, ... into a target
 column of your choice — its dropdown is header-labelled the same way. Both the
@@ -104,10 +130,11 @@ Nothing is written to the target file until you click Append.
 **Append to Log** stays greyed out, with the reason shown in the status line,
 when:
 
-- no mappings are defined,
+- no mappings **or lookups** are defined,
+- a lookup's file is missing, its tab isn't chosen, or its tab can't be read,
 - a source or target column is invalid,
-- two mappings (or a mapping and the Auto ID) write to the **same** target
-  column,
+- two outputs (any combination of mapping, lookup, or the Auto ID) write to the
+  **same** target column,
 - the Auto ID prefix or target tab name is blank,
 - the target tab name uses characters Excel forbids (`[ ] : * ? / \`) or is
   longer than 31 characters.

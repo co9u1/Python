@@ -380,6 +380,126 @@ class MappingRow:
         return self.delimiter.get().strip() if self.delim_enabled.get() else ""
 
 
+class LookupRow:
+    """One VLOOKUP-style rule: a source column keys into an external workbook."""
+
+    def __init__(self, app, parent):
+        self.app = app
+        self.path = tk.StringVar()
+        self.sheet = tk.StringVar()
+        self.key_col = tk.StringVar(value="A")
+        self.val_col = tk.StringVar(value="B")
+        self.source_col = tk.StringVar(value="A")
+        self.target_col = tk.StringVar(value="A")
+        self.fallback = tk.StringVar()
+        self.lookup_columns = list(COLUMN_CHOICES)
+
+        self.frame = tk.Frame(parent, bg=BG_CARD, highlightthickness=1,
+                              highlightbackground=BORDER)
+        self.frame.pack(fill="x", pady=4)
+
+        # Row A - which workbook and tab holds the lookup table
+        top = tk.Frame(self.frame, bg=BG_CARD)
+        top.pack(fill="x", padx=8, pady=(7, 3))
+        ttk.Label(top, text="Lookup file").pack(side="left")
+        ttk.Entry(top, textvariable=self.path, width=34).pack(
+            side="left", fill="x", expand=True, padx=(6, 8)
+        )
+        PillButton(
+            top, "Browse...", command=self.pick_file, bg_page=BG_CARD,
+            fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE, fill_disabled=SECONDARY_BG,
+            fg=SECONDARY_FG, font=(FONT, 10, "bold"), padx=12, pady=6,
+        ).pack(side="left")
+        ttk.Label(top, text="tab").pack(side="left", padx=(10, 4))
+        self.sheet_combo = ttk.Combobox(
+            top, textvariable=self.sheet, width=16, state="readonly"
+        )
+        self.sheet_combo.pack(side="left")
+        PillButton(
+            top, "✕", command=self.remove, bg_page=BG_CARD,
+            fill=SECONDARY_BG, fill_active="#f3c9c9", fill_disabled=SECONDARY_BG,
+            fg=SECONDARY_FG, font=(FONT, 10, "bold"), padx=10, pady=6,
+        ).pack(side="right", padx=(8, 0))
+
+        # Row B - which value is matched against which lookup column
+        mid = tk.Frame(self.frame, bg=BG_CARD)
+        mid.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(mid, text="Key from source").pack(side="left")
+        self.source_combo = ttk.Combobox(
+            mid, textvariable=self.source_col, width=16, values=app.source_columns
+        )
+        self.source_combo.pack(side="left", padx=(6, 12))
+        ttk.Label(mid, text="match on").pack(side="left")
+        self.key_combo = ttk.Combobox(
+            mid, textvariable=self.key_col, width=15, state="readonly",
+            values=self.lookup_columns,
+        )
+        self.key_combo.pack(side="left", padx=(6, 12))
+        ttk.Label(mid, text="return").pack(side="left")
+        self.val_combo = ttk.Combobox(
+            mid, textvariable=self.val_col, width=15, state="readonly",
+            values=self.lookup_columns,
+        )
+        self.val_combo.pack(side="left", padx=6)
+
+        # Row C - where the result lands
+        bot = tk.Frame(self.frame, bg=BG_CARD)
+        bot.pack(fill="x", padx=8, pady=(0, 7))
+        ttk.Label(bot, text="Write result to").pack(side="left")
+        self.target_combo = ttk.Combobox(
+            bot, textvariable=self.target_col, width=16, state="readonly",
+            values=app.target_columns,
+        )
+        self.target_combo.pack(side="left", padx=(6, 12))
+        ttk.Label(bot, text="if no match, write").pack(side="left")
+        ttk.Entry(bot, textvariable=self.fallback, width=14).pack(side="left", padx=6)
+        ttk.Label(
+            bot, text="(blank leaves the cell empty)", style="Muted.TLabel"
+        ).pack(side="left", padx=4)
+
+        for var in (self.source_col, self.key_col, self.val_col,
+                    self.target_col, self.fallback):
+            var.trace_add("write", app._schedule_refresh)
+        for var in (self.path, self.sheet):
+            var.trace_add("write", self._on_file_change)
+
+    def pick_file(self):
+        path = filedialog.askopenfilename(
+            title="Select the lookup workbook",
+            filetypes=[("Excel files", "*.xlsx *.xlsm")],
+        )
+        if path:
+            self.path.set(path)
+
+    def _on_file_change(self, *_args):
+        """Refresh the tab list and relabel the key/return dropdowns."""
+        path = self.path.get().strip()
+        sheets = []
+        if path and os.path.exists(path):
+            try:
+                wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+                sheets = list(wb.sheetnames)
+                wb.close()
+            except Exception:
+                sheets = []
+        self.sheet_combo["values"] = sheets
+        if sheets and self.sheet.get().strip() not in sheets:
+            self.sheet.set(sheets[0])
+            return  # setting sheet re-enters this handler
+
+        labels = self.app._column_labels(path, self.sheet.get().strip())
+        self.lookup_columns = labels
+        self.app._relabel(self.key_combo, self.key_col, labels)
+        self.app._relabel(self.val_combo, self.val_col, labels)
+        self.app._schedule_refresh()
+
+    def remove(self):
+        self.app.remove_lookup(self)
+
+    def destroy(self):
+        self.frame.destroy()
+
+
 class ColumnMapperApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -405,6 +525,8 @@ class ColumnMapperApp(tk.Tk):
         self.source_columns = list(COLUMN_CHOICES)
         self.target_columns = list(COLUMN_CHOICES)
         self.mappings = []
+        self.lookups = []
+        self._lookup_cache = {}
         self._preview_rows = []
 
         # Live-preview plumbing: a debounce handle plus caches so a refresh
@@ -524,8 +646,17 @@ class ColumnMapperApp(tk.Tk):
         body.pack(fill="both", expand=True)
         tk.Frame(body, bg=BG_MAIN, height=8).pack(fill="x")
 
+        notebook = ttk.Notebook(body)
+        notebook.pack(fill="x", padx=14, pady=(0, 8))
+        tab_files = tk.Frame(notebook, bg=BG_MAIN)
+        tab_maps = tk.Frame(notebook, bg=BG_MAIN)
+        tab_lookups = tk.Frame(notebook, bg=BG_MAIN)
+        notebook.add(tab_files, text="  ①  Files  ")
+        notebook.add(tab_maps, text="  ②  Column Mappings  ")
+        notebook.add(tab_lookups, text="  ③  Lookups  ")
+
         # Source
-        frame_src = self._card(body, "①  Source File")
+        frame_src = self._card(tab_files, "Source File")
 
         row1 = ttk.Frame(frame_src)
         row1.pack(fill="x", padx=12, pady=(9, 6))
@@ -552,7 +683,7 @@ class ColumnMapperApp(tk.Tk):
 
         # Target
 
-        frame_dst = self._card(body, "②  Target Workbook")
+        frame_dst = self._card(tab_files, "Target Workbook")
 
         row3 = ttk.Frame(frame_dst)
         row3.pack(fill="x", padx=12, pady=(9, 6))
@@ -592,7 +723,7 @@ class ColumnMapperApp(tk.Tk):
         ).pack(anchor="w", padx=12, pady=(0, 8))
 
         # Mappings
-        frame_map = self._card(body, "③  Column Mappings")
+        frame_map = self._card(tab_maps, "Column Mappings")
 
         id_row = tk.Frame(frame_map, bg=BG_CARD)
         id_row.pack(fill="x", padx=12, pady=(12, 6))
@@ -631,6 +762,33 @@ class ColumnMapperApp(tk.Tk):
         ttk.Label(
             add_row,
             text="Tick “extract after” to trim a value; leave it off to copy the cell whole.",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=12)
+
+        # Lookups
+        frame_lk = self._card(tab_lookups, "Lookups")
+
+        ttk.Label(
+            frame_lk,
+            text="Look a source value up in another workbook and write the matching "
+            "value to the target - like VLOOKUP.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        self.lookup_area = ScrollArea(frame_lk, bg=BG_CARD, height=196)
+        self.lookup_area.pack(fill="x", padx=12, pady=(0, 6))
+
+        lk_add = tk.Frame(frame_lk, bg=BG_CARD)
+        lk_add.pack(fill="x", padx=12, pady=(0, 12))
+        PillButton(
+            lk_add, "+  Add lookup", command=self.add_lookup,
+            bg_page=BG_CARD, fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE,
+            fill_disabled=SECONDARY_BG, fg=SECONDARY_FG, font=(FONT, 11, "bold"),
+            padx=16, pady=8,
+        ).pack(side="left")
+        ttk.Label(
+            lk_add,
+            text="Matching ignores case and surrounding spaces.",
             style="Muted.TLabel",
         ).pack(side="left", padx=12)
 
@@ -723,6 +881,56 @@ class ColumnMapperApp(tk.Tk):
         row.destroy()
         self._schedule_refresh()
 
+    # ---------- Lookup management ----------
+    def add_lookup(self):
+        row = LookupRow(self, self.lookup_area.inner)
+        self.lookups.append(row)
+        self._schedule_refresh()
+        return row
+
+    def remove_lookup(self, row):
+        if row not in self.lookups:
+            return
+        self.lookups.remove(row)
+        row.destroy()
+        self._schedule_refresh()
+
+    def _lookup_table(self, path, sheet, key_idx, val_idx):
+        """Build {normalised key: value} from a lookup sheet, cached by mtime.
+
+        Keys are trimmed and lowercased. The first occurrence of a duplicate
+        key wins, matching how VLOOKUP returns the first match.
+        """
+        try:
+            cache_key = (path, sheet, key_idx, val_idx, os.path.getmtime(path))
+        except OSError:
+            return None
+        if cache_key in self._lookup_cache:
+            return self._lookup_cache[cache_key]
+
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            if sheet not in wb.sheetnames:
+                wb.close()
+                return None
+            width = max(key_idx, val_idx)
+            table = {}
+            for raw in wb[sheet].iter_rows(min_col=1, max_col=width, values_only=True):
+                key = raw[key_idx - 1] if key_idx - 1 < len(raw) else None
+                if key in (None, ""):
+                    continue
+                norm = str(key).strip().lower()
+                if norm in table:
+                    continue
+                val = raw[val_idx - 1] if val_idx - 1 < len(raw) else None
+                table[norm] = "" if val in (None, "") else str(val).strip()
+            wb.close()
+        except Exception:
+            return None
+
+        self._lookup_cache[cache_key] = table
+        return table
+
     def _on_id_toggle(self):
         state = "normal" if self.id_enabled.get() else "disabled"
         self.id_prefix_entry.configure(state=state)
@@ -770,6 +978,8 @@ class ColumnMapperApp(tk.Tk):
         self.source_columns = labels
         for m in self.mappings:
             self._relabel(m.source_combo, m.source_col, labels)
+        for lk in self.lookups:
+            self._relabel(lk.source_combo, lk.source_col, labels)
 
     def _on_target_sheet_change(self, *_args):
         """Relabel the target column dropdowns from the target tab's header row."""
@@ -783,6 +993,8 @@ class ColumnMapperApp(tk.Tk):
         self.target_columns = labels
         for m in self.mappings:
             self._relabel(m.target_combo, m.target_col, labels)
+        for lk in self.lookups:
+            self._relabel(lk.target_combo, lk.target_col, labels)
         self._relabel(self.id_col_combo, self.id_col, labels)
 
     # ---------- Preview table columns ----------
@@ -805,6 +1017,12 @@ class ColumnMapperApp(tk.Tk):
             if delim:
                 label += f"  (after '{delim}')"
             specs.append((f"m{i}", label, 200, "w"))
+        for i, lk in enumerate(self.lookups):
+            label = (
+                f"{letter(lk.source_col.get())} ⇒ "
+                f"{letter(lk.target_col.get())}  (lookup)"
+            )
+            specs.append((f"l{i}", label, 200, "w"))
         specs.append(("__note", "Note", 170, "w"))
 
         self.tree.configure(columns=[s[0] for s in specs])
@@ -907,7 +1125,12 @@ class ColumnMapperApp(tk.Tk):
 
     # ---------- Validation ----------
     def _validate(self):
-        """Return (error_message, resolved_mappings) - error is None when valid."""
+        """Return (error_message, plan) - error is None when valid.
+
+        The plan is one entry per output column, in preview order: every
+        column mapping first, then every lookup. Each entry carries what's
+        needed to compute its value from a source row.
+        """
         if not self.source_path.get().strip() or not self.source_sheet.get().strip():
             return "Pick a source file and tab first.", None
         if not self.target_path.get().strip():
@@ -924,10 +1147,10 @@ class ColumnMapperApp(tk.Tk):
             )
         if len(tab) > MAX_SHEET_NAME:
             return f"Tab names are limited to {MAX_SHEET_NAME} characters.", None
-        if not self.mappings:
-            return "Add at least one column mapping.", None
+        if not self.mappings and not self.lookups:
+            return "Add at least one column mapping or lookup.", None
 
-        resolved = []
+        plan = []
         seen_targets = {}
 
         if self.id_enabled.get():
@@ -953,9 +1176,59 @@ class ColumnMapperApp(tk.Tk):
                     None,
                 )
             seen_targets[tgt_idx] = f"the {get_column_letter(src_idx)} mapping"
-            resolved.append((src_idx, tgt_idx, m.effective_delimiter()))
+            delim = m.effective_delimiter()
+            label = f"{get_column_letter(src_idx)} → {get_column_letter(tgt_idx)}"
+            if delim:
+                label += f"  (after '{delim}')"
+            plan.append({
+                "kind": "map", "src": src_idx, "tgt": tgt_idx,
+                "delim": delim, "label": label,
+            })
 
-        return None, resolved
+        for n, lk in enumerate(self.lookups, start=1):
+            path = lk.path.get().strip()
+            sheet = lk.sheet.get().strip()
+            if not path:
+                return f"Lookup {n}: pick a lookup file.", None
+            if not os.path.exists(path):
+                return f"Lookup {n}: that lookup file doesn't exist.", None
+            if not sheet:
+                return f"Lookup {n}: pick a tab in the lookup file.", None
+
+            src_idx = parse_column(lk.source_col.get())
+            key_idx = parse_column(lk.key_col.get())
+            val_idx = parse_column(lk.val_col.get())
+            tgt_idx = parse_column(lk.target_col.get())
+            if not src_idx:
+                return f"Lookup {n}: '{lk.source_col.get()}' isn't a valid source column.", None
+            if not key_idx:
+                return f"Lookup {n}: '{lk.key_col.get()}' isn't a valid match column.", None
+            if not val_idx:
+                return f"Lookup {n}: '{lk.val_col.get()}' isn't a valid return column.", None
+            if not tgt_idx:
+                return f"Lookup {n}: '{lk.target_col.get()}' isn't a valid target column.", None
+            if tgt_idx in seen_targets:
+                return (
+                    f"Target column {get_column_letter(tgt_idx)} is used by "
+                    f"{seen_targets[tgt_idx]} and lookup {n}. "
+                    "Each target column must be unique.",
+                    None,
+                )
+
+            table = self._lookup_table(path, sheet, key_idx, val_idx)
+            if table is None:
+                return f"Lookup {n}: couldn't read '{sheet}' in the lookup file.", None
+            if not table:
+                return f"Lookup {n}: no usable rows in '{sheet}'.", None
+
+            seen_targets[tgt_idx] = f"lookup {n}"
+            plan.append({
+                "kind": "lookup", "src": src_idx, "tgt": tgt_idx,
+                "table": table, "fallback": lk.fallback.get().strip(), "n": n,
+                "label": f"{get_column_letter(src_idx)} ⇒ {get_column_letter(tgt_idx)}  (lookup)",
+            })
+
+        return None, plan
 
     # ---------- Source / target reads (cached) ----------
     def _source_rows(self):
@@ -1010,6 +1283,7 @@ class ColumnMapperApp(tk.Tk):
     def _invalidate_caches(self):
         self._src_cache_key = None
         self._tgt_cache_key = None
+        self._lookup_cache.clear()
 
     # ---------- Live preview ----------
     def _schedule_refresh(self, *_args):
@@ -1023,7 +1297,7 @@ class ColumnMapperApp(tk.Tk):
         self._rebuild_tree_columns()
         self._preview_rows = []
 
-        error, resolved = self._validate()
+        error, plan = self._validate()
         if error:
             self.status_badge.set(error, WARNTEXT)
             self.append_btn.set_state("disabled")
@@ -1039,7 +1313,7 @@ class ColumnMapperApp(tk.Tk):
             rows = rows[1:]
 
         start_n = self._next_id_start() if self.id_enabled.get() else 1
-        max_src = max(src for src, _tgt, _d in resolved)
+        max_src = max(step["src"] for step in plan)
         prefix = self.id_prefix.get().strip()
         self._preview_rows = []
         n = start_n
@@ -1050,15 +1324,28 @@ class ColumnMapperApp(tk.Tk):
 
             values = []
             notes = []
-            for src_idx, _tgt_idx, delim in resolved:
-                raw_val = cells[src_idx - 1]
-                extracted = extract_after_delimiter(raw_val, delim)
-                values.append(extracted)
-                letter = get_column_letter(src_idx)
-                if raw_val in (None, ""):
-                    notes.append(f"{letter} empty")
-                elif delim and not extracted:
-                    notes.append(f"{letter}: '{delim}' not found")
+            for step in plan:
+                raw_val = cells[step["src"] - 1]
+                letter = get_column_letter(step["src"])
+
+                if step["kind"] == "map":
+                    value = extract_after_delimiter(raw_val, step["delim"])
+                    if raw_val in (None, ""):
+                        notes.append(f"{letter} empty")
+                    elif step["delim"] and not value:
+                        notes.append(f"{letter}: '{step['delim']}' not found")
+                else:
+                    if raw_val in (None, ""):
+                        value = step["fallback"]
+                        notes.append(f"{letter} empty")
+                    else:
+                        hit = step["table"].get(str(raw_val).strip().lower())
+                        if hit is None:
+                            value = step["fallback"]
+                            notes.append(f"lookup {step['n']}: no match for '{raw_val}'")
+                        else:
+                            value = hit
+                values.append(value)
 
             id_str = f"{prefix}{n:0{ID_PAD}d}" if self.id_enabled.get() else None
             self._preview_rows.append((id_str, values, "; ".join(notes)))
@@ -1081,11 +1368,15 @@ class ColumnMapperApp(tk.Tk):
         id_note = ""
         if self.id_enabled.get():
             id_note = f"IDs {self._preview_rows[0][0]}-{self._preview_rows[-1][0]}. "
+        n_maps = sum(1 for s in plan if s["kind"] == "map")
+        n_lookups = len(plan) - n_maps
+        what = f"{n_maps} mapping(s)"
+        if n_lookups:
+            what += f" + {n_lookups} lookup(s)"
         self.status_badge.set(
             (
-                f"{len(self._preview_rows)} row(s) ready across "
-                f"{len(resolved)} mapping(s). {id_note}"
-                f"{warn_count} row(s) flagged."
+                f"{len(self._preview_rows)} row(s) ready across {what}. "
+                f"{id_note}{warn_count} row(s) flagged."
             ),
             (WARNTEXT if warn_count else SUCCESS),
         )
@@ -1103,7 +1394,7 @@ class ColumnMapperApp(tk.Tk):
             )
             return
 
-        error, resolved = self._validate()
+        error, plan = self._validate()
         if error:
             messagebox.showwarning("Check the settings", error)
             return
@@ -1129,11 +1420,13 @@ class ColumnMapperApp(tk.Tk):
                 ws = tgt_wb.create_sheet(tgt_sheet)
                 if self.id_enabled.get():
                     ws.cell(row=1, column=parse_column(self.id_col.get()), value="ID")
-                for src_idx, tgt_idx, _delim in resolved:
-                    ws.cell(
-                        row=1, column=tgt_idx,
-                        value=f"Column {get_column_letter(src_idx)}",
+                for step in plan:
+                    heading = (
+                        f"Column {get_column_letter(step['src'])}"
+                        if step["kind"] == "map"
+                        else f"Lookup {step['n']}"
                     )
+                    ws.cell(row=1, column=step["tgt"], value=heading)
 
             start_row = last_used_row(ws) + 1
             if start_row < 2:
@@ -1145,8 +1438,8 @@ class ColumnMapperApp(tk.Tk):
                 r = start_row + i
                 if id_idx:
                     ws.cell(row=r, column=id_idx, value=id_str)
-                for (_src_idx, tgt_idx, _delim), value in zip(resolved, values):
-                    ws.cell(row=r, column=tgt_idx, value=value)
+                for step, value in zip(plan, values):
+                    ws.cell(row=r, column=step["tgt"], value=value)
 
             tgt_wb.save(tgt_path)
 
