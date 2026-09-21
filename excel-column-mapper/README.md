@@ -172,6 +172,36 @@ borders, alignment, number formats and row heights were identical in all three.
 Workbook **structure** protection (the lock on adding, deleting or renaming
 sheets) is *not* touched by this option and is always preserved.
 
+## Keeping appended rows editable
+
+Excel blocks a cell only when **both** are true: the sheet is protected *and*
+the cell is locked. Cells are locked by default, so a protected sheet blocks
+everything except cells that were deliberately unlocked.
+
+Appended rows inherit the template row's locked flag along with its formatting.
+If that row is locked — or if **Match the formatting of row 2** is off, so cells
+get the locked-by-default style — the new rows refuse edits on a protected
+sheet. Clicking a validation dropdown in one gives *"The cell you're trying to
+change is on a protected sheet."*
+
+**Unlock the cells in appended rows** (off by default) marks just those rows
+unlocked, so they behave like your existing data rows while the sheet stays
+protected. It's the usual fix if you want protection *and* usable dropdowns —
+removing protection isn't necessary.
+
+Unlocking covers the sheet's full used width, not only the mapped columns, so a
+dropdown in a column the app never writes to still works on the new rows.
+Existing rows are never modified.
+
+Use `check_protection.py` to see the state of any workbook:
+
+```bash
+.venv/bin/python check_protection.py Audit.xlsx Log G2 G3 G500
+```
+
+It reports workbook and per-sheet protection, and for each cell whether it's
+locked and whether Excel will therefore block it.
+
 > **Note on formatting:** saving goes through `openpyxl`, which rebuilds the
 > workbook file. Cell values, formulas, and sheet structure survive, and macros
 > are preserved in `.xlsm` files. Charts, images, and pivot tables are *not*

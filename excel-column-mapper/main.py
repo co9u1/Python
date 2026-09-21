@@ -40,6 +40,7 @@ import openpyxl
 from openpyxl.formatting.formatting import ConditionalFormattingList
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.cell_range import MultiCellRange
+from openpyxl.styles import Protection
 from openpyxl.worksheet.protection import SheetProtection
 
 APP_TITLE = "Excel Column Mapper"
@@ -322,6 +323,19 @@ def restore_validation_extensions(path, blocks, stretch=None):
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def unlock_row_cells(ws, row_idx, last_col):
+    """Mark a row's cells unlocked so they stay editable on a protected sheet.
+
+    Excel blocks a cell only when the sheet is protected *and* the cell is
+    locked, and cells are locked by default. Appended rows otherwise inherit
+    the template row's locked flag, so on a protected sheet they refuse
+    edits - including picking from a validation dropdown.
+    """
+    for col in range(1, last_col + 1):
+        cell = ws.cell(row=row_idx, column=col)
+        cell.protection = Protection(locked=False, hidden=cell.protection.hidden)
 
 
 def remove_sheet_protection(sheets):
@@ -856,6 +870,7 @@ class ColumnMapperApp(tk.Tk):
         self.keep_backup = tk.BooleanVar(value=True)
         self.unprotect = tk.BooleanVar(value=False)
         self.unprotect_scope = tk.StringVar(value=UNPROTECT_TAB)
+        self.unlock_new_rows = tk.BooleanVar(value=False)
         self._target_scan_job = None
 
         self.id_enabled = tk.BooleanVar(value=True)
@@ -1100,6 +1115,19 @@ class ColumnMapperApp(tk.Tk):
             text="validation, formatting and cell contents are untouched",
             style="Muted.TLabel",
         ).pack(side="left", padx=4)
+
+        row8 = ttk.Frame(frame_dst)
+        row8.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Checkbutton(
+            row8,
+            text="Unlock the cells in appended rows",
+            variable=self.unlock_new_rows,
+        ).pack(side="left")
+        ttk.Label(
+            row8,
+            text="keeps the sheet protected but lets you edit the new rows",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=8)
 
         ttk.Label(
             frame_dst,
@@ -1866,11 +1894,25 @@ class ColumnMapperApp(tk.Tk):
             # row we know about.
             template = row_style_template(ws) if self.copy_format.get() else None
 
+            # Unlock across the sheet's used width, not just the mapped
+            # columns, so dropdowns in columns the app doesn't write stay
+            # usable on the new rows too.
+            unlock_to = 0
+            if self.unlock_new_rows.get():
+                unlock_to = max(
+                    [ws.max_column] + [step["tgt"] for step in plan]
+                    + ([parse_column(self.id_col.get())] if self.id_enabled.get() else [])
+                )
+
             id_idx = parse_column(self.id_col.get()) if self.id_enabled.get() else None
 
             for i, (id_str, values, _note) in enumerate(self._preview_rows):
                 r = start_row + i
                 apply_row_style(ws, r, template)
+                if unlock_to:
+                    # After the style copy, which would otherwise reinstate
+                    # the template row's locked flag.
+                    unlock_row_cells(ws, r, unlock_to)
                 if id_idx:
                     ws.cell(row=r, column=id_idx, value=id_str)
                 for step, value in zip(plan, values):
