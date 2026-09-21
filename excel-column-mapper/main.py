@@ -143,8 +143,40 @@ def apply_row_style(ws, row_idx, template):
 SHEET_RE = re.compile(r'<sheet\b[^>]*?name="([^"]+)"[^>]*?r:id="([^"]+)"[^>]*/>')
 REL_RE = re.compile(r"<Relationship\b[^>]*/>")
 XM_SQREF_RE = re.compile(r"(<xm:sqref>)([^<]*)(</xm:sqref>)")
+ROOT_TAG_RE = re.compile(r"<worksheet\b[^>]*>")
+XMLNS_RE = re.compile(r'xmlns:([A-Za-z][\w.-]*)\s*=\s*"([^"]*)"')
+TAG_RE = re.compile(r"<[^>]+>")
+QNAME_RE = re.compile(r"(?<![\w.-])([A-Za-z][\w.-]*):[A-Za-z]")
+EXT_TAG_RE = re.compile(r"<ext\b")
 EXT_OPEN = "<extLst>"
 EXT_CLOSE = "</extLst>"
+
+
+def _self_contained(block, root_tag):
+    """Copy namespace declarations the block relies on onto its <ext> tags.
+
+    Excel normally declares xmlns:x14 and xmlns:xm on the root <worksheet>
+    element rather than on each <ext>. Lifted out and spliced into a sheet
+    openpyxl rewrote, those prefixes would be unbound and the workbook
+    would not open, so the declarations travel with the block.
+    """
+    declared_here = set(XMLNS_RE.findall(block))
+    already = {prefix for prefix, _uri in declared_here}
+    available = dict(XMLNS_RE.findall(root_tag))
+
+    used = set()
+    for tag in TAG_RE.findall(block):
+        used.update(QNAME_RE.findall(tag))
+    used.discard("xmlns")
+
+    missing = [
+        f' xmlns:{prefix}="{available[prefix]}"'
+        for prefix in sorted(used)
+        if prefix not in already and prefix in available
+    ]
+    if not missing:
+        return block
+    return EXT_TAG_RE.sub(lambda m: m.group(0) + "".join(missing), block)
 
 
 def worksheet_extlst_span(xml):
@@ -229,8 +261,10 @@ def read_validation_extensions(path):
                 if not span:
                     continue
                 block = xml[span[0]:span[1]]
-                if "x14:dataValidation" in block:
-                    found[name] = block
+                if "x14:dataValidation" not in block:
+                    continue
+                root = ROOT_TAG_RE.search(xml)
+                found[name] = _self_contained(block, root.group(0) if root else "")
             return found
     except (zipfile.BadZipFile, OSError):
         return {}
@@ -286,24 +320,33 @@ def restore_validation_extensions(path, blocks, stretch=None):
             os.remove(tmp_path)
 
 
-def workbook_is_readable(path):
-    """Cheap structural check that Excel stands a chance of opening this.
+def workbook_problem(path):
+    """Describe why a saved workbook looks unreadable, or None if it's fine.
 
     Every XML part must parse and openpyxl must be able to reload the file.
-    Not a guarantee Excel is happy, but it catches malformed output before
-    it replaces the user's workbook.
+    Not proof that Excel is happy, but it catches malformed output before it
+    replaces the user's workbook. Returns the reason so a failure can be
+    diagnosed instead of just reported.
     """
     try:
         with zipfile.ZipFile(path) as zf:
-            if zf.testzip() is not None:
-                return False
+            damaged = zf.testzip()
+            if damaged is not None:
+                return f"corrupt entry in the archive: {damaged}"
             for name in zf.namelist():
                 if name.endswith((".xml", ".rels")):
-                    ElementTree.fromstring(zf.read(name))
+                    try:
+                        ElementTree.fromstring(zf.read(name))
+                    except ElementTree.ParseError as exc:
+                        return f"{name} is not valid XML ({exc})"
+    except (zipfile.BadZipFile, OSError) as exc:
+        return f"the file could not be read as a workbook ({exc})"
+
+    try:
         openpyxl.load_workbook(path, read_only=True).close()
-        return True
-    except Exception:
-        return False
+    except Exception as exc:  # noqa: BLE001 - report whatever openpyxl raises
+        return f"openpyxl could not reopen it ({type(exc).__name__}: {exc})"
+    return None
 
 
 def _stretch_extension_ranges(block, last_row):
@@ -1818,11 +1861,9 @@ class ColumnMapperApp(tk.Tk):
 
             self.status_badge.set("Verifying the saved workbook...", WARNTEXT)
             self.update()
-            if not workbook_is_readable(tgt_path):
-                raise RuntimeError(
-                    "the saved workbook failed its integrity check, so your "
-                    "original file has been put back unchanged"
-                )
+            problem = workbook_problem(tgt_path)
+            if problem:
+                raise RuntimeError(f"integrity check failed - {problem}")
 
             if self.keep_backup.get() and rollback:
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
