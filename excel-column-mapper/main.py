@@ -29,6 +29,8 @@ import re
 import shutil
 import zipfile
 from copy import copy
+from datetime import datetime
+from xml.etree import ElementTree
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -140,8 +142,44 @@ def apply_row_style(ws, row_idx, template):
 
 SHEET_RE = re.compile(r'<sheet\b[^>]*?name="([^"]+)"[^>]*?r:id="([^"]+)"[^>]*/>')
 REL_RE = re.compile(r"<Relationship\b[^>]*/>")
-EXTLST_RE = re.compile(r"<extLst>.*?</extLst>", re.S)
 XM_SQREF_RE = re.compile(r"(<xm:sqref>)([^<]*)(</xm:sqref>)")
+EXT_OPEN = "<extLst>"
+EXT_CLOSE = "</extLst>"
+
+
+def worksheet_extlst_span(xml):
+    """Locate the worksheet-level <extLst>, returning (start, end) or None.
+
+    <extLst> is not unique in a sheet: conditional formatting rules nest one
+    for data bars, icon sets and colour scales. Only the final child of
+    <worksheet> is the sheet-level list, so match that one by walking back
+    from the close tag and balancing nested pairs. Matching the first
+    <extLst> in the file instead splices content into a <cfRule>, which
+    Excel rejects as a corrupt workbook.
+    """
+    end_ws = xml.rfind("</worksheet>")
+    if end_ws == -1:
+        return None
+    close = xml.rfind(EXT_CLOSE, 0, end_ws)
+    if close == -1 or xml[close + len(EXT_CLOSE):end_ws].strip():
+        return None
+
+    depth = 0
+    idx = close
+    while idx > 0:
+        prev_open = xml.rfind(EXT_OPEN, 0, idx)
+        prev_close = xml.rfind(EXT_CLOSE, 0, idx)
+        if prev_open == -1:
+            return None
+        if prev_close > prev_open:
+            depth += 1
+            idx = prev_close
+        elif depth == 0:
+            return (prev_open, close + len(EXT_CLOSE))
+        else:
+            depth -= 1
+            idx = prev_open
+    return None
 
 
 def _sheet_part_map(zf):
@@ -187,9 +225,12 @@ def read_validation_extensions(path):
                     xml = zf.read(part).decode("utf-8")
                 except KeyError:
                     continue
-                match = EXTLST_RE.search(xml)
-                if match and "x14:dataValidation" in match.group(0):
-                    found[name] = match.group(0)
+                span = worksheet_extlst_span(xml)
+                if not span:
+                    continue
+                block = xml[span[0]:span[1]]
+                if "x14:dataValidation" in block:
+                    found[name] = block
             return found
     except (zipfile.BadZipFile, OSError):
         return {}
@@ -227,23 +268,42 @@ def restore_validation_extensions(path, blocks, stretch=None):
                 block = wanted.get(item.filename)
                 if block:
                     xml = data.decode("utf-8")
-                    existing = EXTLST_RE.search(xml)
-                    if existing:
-                        # openpyxl wrote its own extLst; a worksheet may only
-                        # have one, so merge ours into it rather than append.
-                        inner = block[len("<extLst>"):-len("</extLst>")]
-                        merged = (
-                            existing.group(0)[: -len("</extLst>")] + inner + "</extLst>"
-                        )
-                        xml = xml[: existing.start()] + merged + xml[existing.end():]
+                    span = worksheet_extlst_span(xml)
+                    inner = block[len(EXT_OPEN):-len(EXT_CLOSE)]
+                    if span:
+                        # A worksheet may carry only one sheet-level extLst,
+                        # so merge into the existing one rather than append.
+                        existing = xml[span[0]:span[1]]
+                        merged = existing[: -len(EXT_CLOSE)] + inner + EXT_CLOSE
+                        xml = xml[: span[0]] + merged + xml[span[1]:]
                     else:
-                        xml = xml.replace("</worksheet>", f"{block}</worksheet>")
+                        xml = xml.replace("</worksheet>", f"{block}</worksheet>", 1)
                     data = xml.encode("utf-8")
                 out.writestr(item, data)
         shutil.move(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def workbook_is_readable(path):
+    """Cheap structural check that Excel stands a chance of opening this.
+
+    Every XML part must parse and openpyxl must be able to reload the file.
+    Not a guarantee Excel is happy, but it catches malformed output before
+    it replaces the user's workbook.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if zf.testzip() is not None:
+                return False
+            for name in zf.namelist():
+                if name.endswith((".xml", ".rels")):
+                    ElementTree.fromstring(zf.read(name))
+        openpyxl.load_workbook(path, read_only=True).close()
+        return True
+    except Exception:
+        return False
 
 
 def _stretch_extension_ranges(block, last_row):
@@ -733,6 +793,7 @@ class ColumnMapperApp(tk.Tk):
         self.target_has_header = tk.BooleanVar(value=True)
         self.copy_format = tk.BooleanVar(value=True)
         self.extend_validation = tk.BooleanVar(value=True)
+        self.keep_backup = tk.BooleanVar(value=True)
         self._target_scan_job = None
 
         self.id_enabled = tk.BooleanVar(value=True)
@@ -949,6 +1010,17 @@ class ColumnMapperApp(tk.Tk):
         ttk.Label(
             row5,
             text="make appended rows look and behave like that row",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=8)
+
+        row6 = ttk.Frame(frame_dst)
+        row6.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Checkbutton(
+            row6, text="Keep a timestamped backup", variable=self.keep_backup
+        ).pack(side="left")
+        ttk.Label(
+            row6,
+            text="a failed write always rolls the file back either way",
             style="Muted.TLabel",
         ).pack(side="left", padx=8)
 
@@ -1670,6 +1742,16 @@ class ColumnMapperApp(tk.Tk):
         self.status_badge.set(f"Opening the target workbook ({total} row(s))...", WARNTEXT)
         self.update()
 
+        # Keep an untouched copy so a bad write can be rolled back rather than
+        # destroying the only version of the workbook.
+        rollback = None
+        if os.path.exists(tgt_path):
+            rollback = f"{tgt_path}.rollback"
+            try:
+                shutil.copy2(tgt_path, rollback)
+            except OSError:
+                rollback = None
+
         try:
             # Must be read before openpyxl opens the workbook, since it drops
             # x14 validation extensions silently.
@@ -1734,6 +1816,19 @@ class ColumnMapperApp(tk.Tk):
                 stretch = (tgt_sheet, start_row + total - 1)
             restore_validation_extensions(tgt_path, saved_extensions, stretch)
 
+            self.status_badge.set("Verifying the saved workbook...", WARNTEXT)
+            self.update()
+            if not workbook_is_readable(tgt_path):
+                raise RuntimeError(
+                    "the saved workbook failed its integrity check, so your "
+                    "original file has been put back unchanged"
+                )
+
+            if self.keep_backup.get() and rollback:
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                base, ext = os.path.splitext(tgt_path)
+                shutil.copy2(rollback, f"{base}.backup-{stamp}{ext}")
+
             messagebox.showinfo(
                 "Done", f"Appended {total:,} row(s) to '{tgt_sheet}'."
             )
@@ -1745,6 +1840,8 @@ class ColumnMapperApp(tk.Tk):
             )
 
         except PermissionError:
+            self._restore_rollback(rollback)
+            rollback = None
             self._mark_stale(
                 "Target file is locked - close it in Excel and try again.", ERROR
             )
@@ -1755,8 +1852,32 @@ class ColumnMapperApp(tk.Tk):
                 "written yet.",
             )
         except Exception as e:
-            self._mark_stale("Append failed - see the error for details.", ERROR)
-            messagebox.showerror("Error", f"Could not append to target workbook:\n{e}")
+            restored = self._restore_rollback(rollback)
+            rollback = None
+            self._mark_stale("Append failed - your file was put back.", ERROR)
+            messagebox.showerror(
+                "Error",
+                f"Could not append to target workbook:\n{e}\n\n"
+                + (
+                    "Your original workbook has been restored unchanged."
+                    if restored
+                    else "No backup was available, so check the file before reusing it."
+                ),
+            )
+        finally:
+            if rollback and os.path.exists(rollback):
+                os.remove(rollback)
+
+    @staticmethod
+    def _restore_rollback(rollback):
+        """Put the untouched copy back after a failed write."""
+        if not rollback or not os.path.exists(rollback):
+            return False
+        try:
+            shutil.move(rollback, rollback[: -len(".rollback")])
+            return True
+        except OSError:
+            return False
 
 
 def main():

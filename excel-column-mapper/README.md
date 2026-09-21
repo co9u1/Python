@@ -130,6 +130,26 @@ dropdowns survive. Their ranges are extended to cover appended rows too.
 > land just outside the table. Convert the range to a normal one, or extend the
 > table by hand afterwards.
 
+> **Extended conditional formatting is lost.** Data bars, icon sets and colour
+> scales configured through Excel's newer options are stored as `x14` blocks
+> nested inside each rule. openpyxl drops those when it rewrites the sheet, and
+> unlike the validation blocks they can't be spliced back reliably because the
+> rules they attach to are themselves rewritten. Plain rules — "highlight cells
+> equal to", simple colour scales — survive normally.
+
+## Safety
+
+The target workbook is copied before any write. After saving, the result is
+checked: every XML part must parse and openpyxl must be able to reopen the file.
+**If that check fails, your original is put back unchanged** and the error is
+reported — a bad write can't leave you with a broken workbook.
+
+**Keep a timestamped backup** (on by default) additionally leaves a
+`yourfile.backup-YYYYMMDD-HHMMSS.xlsx` beside the original on every successful
+append. Untick it once you trust the tool on your file.
+
+Sheet protection, workbook protection and their passwords are preserved.
+
 > **Note on formatting:** saving goes through `openpyxl`, which rebuilds the
 > workbook file. Cell values, formulas, and sheet structure survive, and macros
 > are preserved in `.xlsm` files. Charts, images, and pivot tables are *not*
