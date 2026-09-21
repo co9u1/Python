@@ -114,6 +114,17 @@ rules** ticked (the default), any **data validation** or **conditional
 formatting** rule that already covers row 2 is stretched down to the last
 appended row. Rules that don't touch row 2 are left exactly as they are.
 
+**Preserving Excel's extended validations** — a validation whose source is a
+range on *another sheet* (`=Lists!$A$1:$A$20`) isn't stored in the normal place.
+Excel puts it in an `x14` extension block, and openpyxl neither reads nor writes
+that block — it warns *"Data Validation extension is not supported and will be
+removed"* and drops it on save. Simple inline lists like `"Yes,No"` live in the
+standard element and survive, which is why those were the only ones left.
+
+The app now reads those extension blocks straight out of the source `.xlsx`
+before openpyxl opens it, and splices them back in afterwards, so cross-sheet
+dropdowns survive. Their ranges are extended to cover appended rows too.
+
 > **Excel Tables are not extended.** If your log is a real Excel Table
 > (Insert → Table), its range still won't grow to include appended rows, so they
 > land just outside the table. Convert the range to a normal one, or extend the

@@ -26,6 +26,8 @@ tables do not.
 
 import os
 import re
+import shutil
+import zipfile
 from copy import copy
 
 import tkinter as tk
@@ -134,6 +136,130 @@ def apply_row_style(ws, row_idx, template):
             ws.cell(row=row_idx, column=col)._style = copy(style)
     if template["height"] is not None:
         ws.row_dimensions[row_idx].height = template["height"]
+
+
+SHEET_RE = re.compile(r'<sheet\b[^>]*?name="([^"]+)"[^>]*?r:id="([^"]+)"[^>]*/>')
+REL_RE = re.compile(r"<Relationship\b[^>]*/>")
+EXTLST_RE = re.compile(r"<extLst>.*?</extLst>", re.S)
+XM_SQREF_RE = re.compile(r"(<xm:sqref>)([^<]*)(</xm:sqref>)")
+
+
+def _sheet_part_map(zf):
+    """Map worksheet name -> its XML part name inside the xlsx zip."""
+    try:
+        workbook_xml = zf.read("xl/workbook.xml").decode("utf-8")
+        rels_xml = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    except KeyError:
+        return {}
+
+    targets = {}
+    for rel in REL_RE.findall(rels_xml):
+        rel_id = re.search(r'Id="([^"]+)"', rel)
+        target = re.search(r'Target="([^"]+)"', rel)
+        if rel_id and target and "worksheets/" in target.group(1):
+            part = target.group(1).lstrip("/")
+            targets[rel_id.group(1)] = part if part.startswith("xl/") else f"xl/{part}"
+
+    return {
+        name: targets[rel_id]
+        for name, rel_id in SHEET_RE.findall(workbook_xml)
+        if rel_id in targets
+    }
+
+
+def read_validation_extensions(path):
+    """Capture each sheet's <extLst> block, keyed by sheet name.
+
+    Excel keeps data validations whose source lives on another sheet in an
+    x14 extension list rather than the standard <dataValidations> element.
+    openpyxl doesn't model that block and drops it on save - it even warns
+    "Data Validation extension is not supported and will be removed" - so
+    those dropdowns vanish from the saved file. Grab the raw XML before
+    openpyxl touches the workbook so it can be put back afterwards.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with zipfile.ZipFile(path) as zf:
+            found = {}
+            for name, part in _sheet_part_map(zf).items():
+                try:
+                    xml = zf.read(part).decode("utf-8")
+                except KeyError:
+                    continue
+                match = EXTLST_RE.search(xml)
+                if match and "x14:dataValidation" in match.group(0):
+                    found[name] = match.group(0)
+            return found
+    except (zipfile.BadZipFile, OSError):
+        return {}
+
+
+def restore_validation_extensions(path, blocks, stretch=None):
+    """Splice preserved <extLst> blocks back into a workbook openpyxl saved.
+
+    `stretch` is (sheet_name, last_row); that sheet's extension ranges are
+    extended the same way the standard rules are.
+    """
+    if not blocks:
+        return
+    try:
+        with zipfile.ZipFile(path) as zf:
+            parts = _sheet_part_map(zf)
+            payload = [(item, zf.read(item.filename)) for item in zf.infolist()]
+    except (zipfile.BadZipFile, OSError):
+        return
+
+    wanted = {parts[name]: block for name, block in blocks.items() if name in parts}
+    if not wanted:
+        return
+
+    if stretch:
+        sheet_name, last_row = stretch
+        part = parts.get(sheet_name)
+        if part in wanted:
+            wanted[part] = _stretch_extension_ranges(wanted[part], last_row)
+
+    tmp_path = f"{path}.tmp-ext"
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as out:
+            for item, data in payload:
+                block = wanted.get(item.filename)
+                if block:
+                    xml = data.decode("utf-8")
+                    existing = EXTLST_RE.search(xml)
+                    if existing:
+                        # openpyxl wrote its own extLst; a worksheet may only
+                        # have one, so merge ours into it rather than append.
+                        inner = block[len("<extLst>"):-len("</extLst>")]
+                        merged = (
+                            existing.group(0)[: -len("</extLst>")] + inner + "</extLst>"
+                        )
+                        xml = xml[: existing.start()] + merged + xml[existing.end():]
+                    else:
+                        xml = xml.replace("</worksheet>", f"{block}</worksheet>")
+                    data = xml.encode("utf-8")
+                out.writestr(item, data)
+        shutil.move(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _stretch_extension_ranges(block, last_row):
+    """Extend <xm:sqref> ranges that cover the template row."""
+    def fix(match):
+        refs = []
+        for ref in match.group(2).split():
+            bounds = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", ref)
+            if bounds:
+                top, bottom = int(bounds.group(2)), int(bounds.group(4))
+                if top <= STYLE_TEMPLATE_ROW <= bottom < last_row:
+                    ref = f"{bounds.group(1)}{top}:{bounds.group(3)}{last_row}"
+            refs.append(ref)
+        return match.group(1) + " ".join(refs) + match.group(3)
+
+    return XM_SQREF_RE.sub(fix, block)
 
 
 def _stretched(sqref, last_row):
@@ -1545,6 +1671,10 @@ class ColumnMapperApp(tk.Tk):
         self.update()
 
         try:
+            # Must be read before openpyxl opens the workbook, since it drops
+            # x14 validation extensions silently.
+            saved_extensions = read_validation_extensions(tgt_path)
+
             if os.path.exists(tgt_path):
                 # Open the existing workbook and edit it in place - never replace it.
                 # keep_vba preserves macros in .xlsm, which openpyxl drops otherwise.
@@ -1598,6 +1728,11 @@ class ColumnMapperApp(tk.Tk):
             self.status_badge.set(f"Saving {total:,} row(s)...", WARNTEXT)
             self.update()
             tgt_wb.save(tgt_path)
+
+            stretch = None
+            if self.extend_validation.get() and total:
+                stretch = (tgt_sheet, start_row + total - 1)
+            restore_validation_extensions(tgt_path, saved_extensions, stretch)
 
             messagebox.showinfo(
                 "Done", f"Appended {total:,} row(s) to '{tgt_sheet}'."
