@@ -33,7 +33,9 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 import openpyxl
+from openpyxl.formatting.formatting import ConditionalFormattingList
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.cell_range import MultiCellRange
 
 APP_TITLE = "Excel Column Mapper"
 DEFAULT_ID_PREFIX = "FS"
@@ -132,6 +134,53 @@ def apply_row_style(ws, row_idx, template):
             ws.cell(row=row_idx, column=col)._style = copy(style)
     if template["height"] is not None:
         ws.row_dimensions[row_idx].height = template["height"]
+
+
+def _stretched(sqref, last_row):
+    """Extend any sub-range covering the template row down to `last_row`.
+
+    Returns (MultiCellRange, changed). MultiCellRange.ranges is a set, so the
+    ranges are pulled into a list before being mutated and rebuilt.
+    """
+    ranges = list(MultiCellRange(str(sqref)).ranges)
+    changed = False
+    for cell_range in ranges:
+        covers_data = cell_range.min_row <= STYLE_TEMPLATE_ROW <= cell_range.max_row
+        if covers_data and cell_range.max_row < last_row:
+            cell_range.max_row = last_row
+            changed = True
+    return MultiCellRange(ranges), changed
+
+
+def extend_data_validations(ws, last_row):
+    """Stretch validation rules that cover the template row down to `last_row`.
+
+    Excel stores a dropdown as a rule over a fixed range such as G2:G500.
+    Rows appended past the end of that range get no dropdown, which looks
+    like the validation was lost. Any rule already covering row 2 is treated
+    as applying to the data rows, so it follows them down. Rules that don't
+    touch row 2 are left exactly as they are.
+    """
+    for rule in ws.data_validations.dataValidation:
+        stretched, changed = _stretched(rule.sqref, last_row)
+        if changed:
+            rule.sqref = stretched
+
+
+def extend_conditional_formatting(ws, last_row):
+    """Same treatment for conditional formatting ranges.
+
+    The rules have to be re-added rather than edited in place, because the
+    list is keyed by range.
+    """
+    saved = [(str(cf.sqref), list(cf.rules)) for cf in ws.conditional_formatting]
+    if not saved:
+        return
+    ws.conditional_formatting = ConditionalFormattingList()
+    for sqref, rules in saved:
+        stretched, _changed = _stretched(sqref, last_row)
+        for rule in rules:
+            ws.conditional_formatting.add(str(stretched), rule)
 
 
 def last_used_row(ws) -> int:
@@ -557,6 +606,7 @@ class ColumnMapperApp(tk.Tk):
         self.target_sheet = tk.StringVar()
         self.target_has_header = tk.BooleanVar(value=True)
         self.copy_format = tk.BooleanVar(value=True)
+        self.extend_validation = tk.BooleanVar(value=True)
         self._target_scan_job = None
 
         self.id_enabled = tk.BooleanVar(value=True)
@@ -573,6 +623,7 @@ class ColumnMapperApp(tk.Tk):
         # Live-preview plumbing: a debounce handle plus caches so a refresh
         # doesn't re-read the workbooks on every keystroke.
         self._refresh_job = None
+        self._preview_stale = True
         self._src_cache_key = None
         self._src_cache_rows = None
         self._tgt_cache_key = None
@@ -764,9 +815,14 @@ class ColumnMapperApp(tk.Tk):
             text=f"Match the formatting of row {STYLE_TEMPLATE_ROW}",
             variable=self.copy_format,
         ).pack(side="left")
+        ttk.Checkbutton(
+            row5,
+            text="Extend validation & rules",
+            variable=self.extend_validation,
+        ).pack(side="left", padx=16)
         ttk.Label(
             row5,
-            text="appended rows copy that row's font, fill, borders and number format",
+            text="make appended rows look and behave like that row",
             style="Muted.TLabel",
         ).pack(side="left", padx=8)
 
@@ -849,8 +905,13 @@ class ColumnMapperApp(tk.Tk):
         # Actions
         frame_actions = tk.Frame(body, bg=BG_MAIN)
         frame_actions.pack(fill="x", padx=17, pady=(0, 9))
+        PillButton(
+            frame_actions, "1. Generate Preview", command=self.refresh_preview,
+            bg_page=BG_MAIN, fill=SECONDARY_BG, fill_active=SECONDARY_ACTIVE,
+            fill_disabled=SECONDARY_BG, fg=SECONDARY_FG, font=(FONT, 11, "bold"),
+        ).pack(side="left", padx=(0, 12))
         self.append_btn = PillButton(
-            frame_actions, "Append to Log", command=self.confirm_append,
+            frame_actions, "2. Append to Log", command=self.confirm_append,
             bg_page=BG_MAIN, fill=ACCENT, fill_active=ACCENT_ACTIVE,
             fill_disabled=ACCENT_DISABLED, fg="#ffffff", font=(FONT, 11, "bold"),
         )
@@ -858,8 +919,7 @@ class ColumnMapperApp(tk.Tk):
         self.append_btn.set_state("disabled")
         ttk.Label(
             frame_actions,
-            text="The preview below updates as you edit - it always shows exactly "
-            "what will be written.",
+            text="Append stays locked until the preview matches your current settings.",
             background=BG_MAIN,
             foreground=TEXT_MUTED,
             font=(FONT, 10),
@@ -901,6 +961,9 @@ class ColumnMapperApp(tk.Tk):
         # Status
         self.status_badge = StatusBadge(body, bg_page=BG_MAIN, font=(FONT, 11))
         self.status_badge.pack(padx=17, pady=(0, 10), anchor="w")
+        self.status_badge.set(
+            "Choose your files and mappings, then click Generate Preview.", TEXT_MUTED
+        )
 
     # ---------- Mapping management ----------
     def add_mapping(self, source_col=None, target_col=None,
@@ -1342,13 +1405,29 @@ class ColumnMapperApp(tk.Tk):
 
     # ---------- Live preview ----------
     def schedule_refresh(self, *_args):
-        """Debounce refreshes so typing doesn't re-read the workbooks per keystroke."""
-        if self._refresh_job is not None:
-            self.after_cancel(self._refresh_job)
-        self._refresh_job = self.after(250, self.refresh_preview)
+        """Mark the preview out of date rather than rebuilding it immediately.
+
+        Rebuilding on every edit is slow on large sheets, so the preview is
+        generated on demand. Append stays disabled while the shown preview
+        doesn't match the current settings, which is what stops the two from
+        silently diverging.
+        """
+        if self._preview_stale:
+            return
+        self._mark_stale("Settings changed - click Generate Preview.")
+
+    def _mark_stale(self, message, color=WARNTEXT):
+        """Drop the shown preview and lock Append until it's regenerated."""
+        self._preview_stale = True
+        self._preview_rows = []
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.append_btn.set_state("disabled")
+        self.status_badge.set(message, color)
 
     def refresh_preview(self):
         self._refresh_job = None
+        self._preview_stale = False
         self._rebuild_tree_columns()
         self._preview_rows = []
 
@@ -1511,29 +1590,37 @@ class ColumnMapperApp(tk.Tk):
                     self.status_badge.set(f"Writing row {i:,} of {total:,}...", WARNTEXT)
                     self.update()
 
+            if self.extend_validation.get() and total:
+                last_row = start_row + total - 1
+                extend_data_validations(ws, last_row)
+                extend_conditional_formatting(ws, last_row)
+
             self.status_badge.set(f"Saving {total:,} row(s)...", WARNTEXT)
             self.update()
             tgt_wb.save(tgt_path)
 
-            self.status_badge.set(
-                f"Appended {len(self._preview_rows)} row(s) to '{tgt_sheet}' in {tgt_path}.",
-                SUCCESS,
-            )
             messagebox.showinfo(
-                "Done",
-                f"Appended {len(self._preview_rows)} row(s) to '{tgt_sheet}'.",
+                "Done", f"Appended {total:,} row(s) to '{tgt_sheet}'."
             )
             self._invalidate_caches()
-            self.schedule_refresh()
+            self._mark_stale(
+                f"Appended {total:,} row(s) to '{tgt_sheet}'. "
+                "Click Generate Preview to continue.",
+                SUCCESS,
+            )
 
         except PermissionError:
+            self._mark_stale(
+                "Target file is locked - close it in Excel and try again.", ERROR
+            )
             messagebox.showerror(
                 "File is locked",
                 "Could not save the target workbook - it looks like it's open in "
-                "Excel.\n\nClose the file there and click Confirm again. Nothing "
-                "has been written yet.",
+                "Excel.\n\nClose the file there and try again. Nothing has been "
+                "written yet.",
             )
         except Exception as e:
+            self._mark_stale("Append failed - see the error for details.", ERROR)
             messagebox.showerror("Error", f"Could not append to target workbook:\n{e}")
 
 

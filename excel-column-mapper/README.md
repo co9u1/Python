@@ -107,6 +107,18 @@ haven't mapped, so banded fills and borders stay unbroken. If the target tab has
 no row 2 yet — a tab the app just created, or one with only headers — appended
 rows simply keep default formatting.
 
+**Extending validation & rules** — Excel stores a dropdown as a rule over a
+fixed range like `G2:G500`. Rows appended past the end of that range get no
+dropdown, which looks like the validation was lost. With **Extend validation &
+rules** ticked (the default), any **data validation** or **conditional
+formatting** rule that already covers row 2 is stretched down to the last
+appended row. Rules that don't touch row 2 are left exactly as they are.
+
+> **Excel Tables are not extended.** If your log is a real Excel Table
+> (Insert → Table), its range still won't grow to include appended rows, so they
+> land just outside the table. Convert the range to a normal one, or extend the
+> table by hand afterwards.
+
 > **Note on formatting:** saving goes through `openpyxl`, which rebuilds the
 > workbook file. Cell values, formulas, and sheet structure survive, and macros
 > are preserved in `.xlsm` files. Charts, images, and pivot tables are *not*
@@ -123,16 +135,22 @@ save succeeds.
 2. **Browse** to the target workbook (existing or new) and choose the target tab.
 3. Set up your **column mappings** — add, remove, and configure delimiters.
 4. Configure **Auto ID**, or untick it.
-5. Click **Append to Log**.
+5. Click **1. Generate Preview**, check the table, then **2. Append to Log**.
 
-**The preview is live.** There's no preview button — the table updates as you
-edit, and always shows exactly what will be written. Its columns follow your
+**The preview is generated on demand**, so nothing is re-read while you're still
+setting things up — which matters on large sheets. Its columns follow your
 mappings, so you can see what lands where. Rows with issues (empty source cell,
-delimiter not found) are highlighted in yellow with a note.
+delimiter not found, no lookup match) are highlighted in yellow with a note.
 
-If the settings aren't valid yet, the status line below the table says why and
-**Append to Log** stays greyed out. Appending recomputes everything from the
-current settings first, so what gets written always matches what's on screen.
+**Append is locked until the preview matches your settings.** Change anything —
+a mapping, a lookup, a tab — and the table clears, the status line reads
+`Settings changed - click Generate Preview`, and **Append** greys out until you
+regenerate. That's what stops the app from writing something different from what
+you're looking at.
+
+If the settings aren't valid, the status line says exactly why. Appending also
+recomputes from the current settings immediately before writing, so a file that
+changed on disk can't slip through.
 
 Nothing is written to the target file until you click Append.
 
