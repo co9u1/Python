@@ -46,8 +46,8 @@ From [ A - Server ]  →  to [ E - Server Name ]   ☐ extract after [        ] 
 - **✕** — removes that mapping.
 
 Use **+ Add mapping** for as many columns as you need. The app starts with two
-mappings (`A → E`, and `B → F` trimmed at `/vol/`), which match the original
-fileshare-audit workflow.
+straight copies (`A → E` and `B → F`); **extract after** is unticked and its box
+empty on every new mapping, so values are copied whole unless you ask otherwise.
 
 **Delimiter matching** is case-insensitive, and `/` and `\` are interchangeable,
 so `/vol/` matches both `/vol/finance` and `\vol\finance`. The delimiter is
@@ -149,6 +149,28 @@ reported — a bad write can't leave you with a broken workbook.
 append. Untick it once you trust the tool on your file.
 
 Sheet protection, workbook protection and their passwords are preserved.
+
+## Removing sheet protection
+
+**Remove sheet protection from …** (off by default) unlocks sheets as part of
+the append. The dropdown beside it chooses the scope:
+
+- **the target tab** *(default)* — only the tab being appended to; every other
+  sheet keeps its protection.
+- **all sheets** — every worksheet, including lookup and reference tabs.
+
+This clears the `<sheetProtection>` element and the stored password hash
+outright. It touches nothing else: data validation, conditional formatting, cell
+styles, row heights and cell contents are all unaffected, because protection is
+a separate element from every one of them.
+
+Verified by running the same workbook three ways — protection left on, target
+tab unlocked, all sheets unlocked — and confirming the only difference was the
+protection flag. Validation ranges, conditional formatting, fonts, fills,
+borders, alignment, number formats and row heights were identical in all three.
+
+Workbook **structure** protection (the lock on adding, deleting or renaming
+sheets) is *not* touched by this option and is always preserved.
 
 > **Note on formatting:** saving goes through `openpyxl`, which rebuilds the
 > workbook file. Cell values, formulas, and sheet structure survive, and macros

@@ -40,11 +40,12 @@ import openpyxl
 from openpyxl.formatting.formatting import ConditionalFormattingList
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.cell_range import MultiCellRange
+from openpyxl.worksheet.protection import SheetProtection
 
 APP_TITLE = "Excel Column Mapper"
 DEFAULT_ID_PREFIX = "FS"
 DEFAULT_ID_COL = "A"
-DEFAULT_DELIMITER = "/vol/"
+DEFAULT_DELIMITER = ""
 ID_PAD = 3
 
 # Excel's own limits on worksheet names.
@@ -56,6 +57,9 @@ STYLE_TEMPLATE_ROW = 2
 
 # How often to report progress (in rows) while writing a large append.
 PROGRESS_EVERY = 2000
+
+UNPROTECT_TAB = "the target tab"
+UNPROTECT_ALL = "all sheets"
 
 COLUMN_CHOICES = [get_column_letter(i) for i in range(1, 41)]  # A..AN
 
@@ -318,6 +322,19 @@ def restore_validation_extensions(path, blocks, stretch=None):
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def remove_sheet_protection(sheets):
+    """Drop sheet protection and its stored password hash.
+
+    Replacing the SheetProtection object clears the element outright;
+    assigning None to .password raises, since that setter hashes whatever
+    it's given. Protection lives in <sheetProtection>, entirely separate
+    from data validation, conditional formatting and cell styles, so none
+    of those are affected.
+    """
+    for sheet in sheets:
+        sheet.protection = SheetProtection()
 
 
 def workbook_problem(path):
@@ -837,6 +854,8 @@ class ColumnMapperApp(tk.Tk):
         self.copy_format = tk.BooleanVar(value=True)
         self.extend_validation = tk.BooleanVar(value=True)
         self.keep_backup = tk.BooleanVar(value=True)
+        self.unprotect = tk.BooleanVar(value=False)
+        self.unprotect_scope = tk.StringVar(value=UNPROTECT_TAB)
         self._target_scan_job = None
 
         self.id_enabled = tk.BooleanVar(value=True)
@@ -862,9 +881,9 @@ class ColumnMapperApp(tk.Tk):
         self._build_style()
         self._build_ui()
 
-        # Start with the two mappings this tool originally hardcoded.
-        self.add_mapping("A", "E", False, DEFAULT_DELIMITER)
-        self.add_mapping("B", "F", True, DEFAULT_DELIMITER)
+        # Start with two straight copies; extraction is opt-in per mapping.
+        self.add_mapping("A", "E")
+        self.add_mapping("B", "F")
 
     # ---------- Styling ----------
     def _build_style(self):
@@ -1066,6 +1085,21 @@ class ColumnMapperApp(tk.Tk):
             text="a failed write always rolls the file back either way",
             style="Muted.TLabel",
         ).pack(side="left", padx=8)
+
+        row7 = ttk.Frame(frame_dst)
+        row7.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Checkbutton(
+            row7, text="Remove sheet protection from", variable=self.unprotect
+        ).pack(side="left")
+        ttk.Combobox(
+            row7, textvariable=self.unprotect_scope, width=14, state="readonly",
+            values=[UNPROTECT_TAB, UNPROTECT_ALL],
+        ).pack(side="left", padx=8)
+        ttk.Label(
+            row7,
+            text="validation, formatting and cell contents are untouched",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=4)
 
         ttk.Label(
             frame_dst,
@@ -1849,6 +1883,12 @@ class ColumnMapperApp(tk.Tk):
                 last_row = start_row + total - 1
                 extend_data_validations(ws, last_row)
                 extend_conditional_formatting(ws, last_row)
+
+            if self.unprotect.get():
+                scope = self.unprotect_scope.get()
+                remove_sheet_protection(
+                    tgt_wb.worksheets if scope == UNPROTECT_ALL else [ws]
+                )
 
             self.status_badge.set(f"Saving {total:,} row(s)...", WARNTEXT)
             self.update()
